@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Michael Stone
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
 CPPFLAGS ?=

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (C) 2026 Michael Stone
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 set -euo pipefail
 
 FFMPEG="/opt/ffmpeg-dvd/bin/ffmpeg"

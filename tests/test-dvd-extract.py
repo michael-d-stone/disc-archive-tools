@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Michael Stone
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 
 import json
 import sys
