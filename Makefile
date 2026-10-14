@@ -53,6 +53,7 @@ test:
 		test_seinfeld_extract
 
 ffmpeg:
+	cd vendor && sha256sum -c SHA256SUMS
 	rm -rf "$(FFMPEG_BUILD)"
 	mkdir -p build
 	tar -C build -xf "$(FFMPEG_ARCHIVE)"
