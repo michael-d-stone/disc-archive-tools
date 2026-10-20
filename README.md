@@ -109,3 +109,27 @@ DVD-Video titles and playable menu content are remuxed without re-encoding. The 
 The current extraction does not reconstruct the original interactive DVD navigation. Menu video and audio are preserved as playable media, but DVD button behavior, navigation commands, and the original interactive menu experience are not reproduced by the resulting MKV files.
 
 `disc-archive-tools` is intended to preserve the authored audiovisual content in accessible, inspectable files rather than emulate a DVD player.
+
+## Testing
+
+Run the regression test suite from the repository root:
+
+```bash
+make test
+```
+
+The regression tests exercise DVD-Video extraction and verification against known test fixtures, including expected titles, menu content, streams, chapters, and durations.
+
+The tests require access to the corresponding test DVD sources; the repository does not contain copyrighted audiovisual content.
+
+## Legal and licensing
+
+`disc-archive-tools` is intended for lawful archival and preservation uses. Users are responsible for complying with applicable copyright law and the terms governing the media they process. Possession of a disc does not necessarily grant the right to reproduce or distribute its contents.
+
+The current DVD-Video workflow does not provide copy-protection removal or decryption. It operates on already-readable DVD sources.
+
+The software in this repository is licensed under the GNU General Public License version 2 or later (`GPL-2.0-or-later`). See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for details.
+
+Third-party software retains its own copyright and licensing terms. See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for dependency and licensing information.
+
+Development history, source provenance, and the use of OpenAI ChatGPT during development are documented in [docs/PROVENANCE.md](docs/PROVENANCE.md).
