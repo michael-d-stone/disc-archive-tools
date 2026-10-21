@@ -81,18 +81,27 @@ and standard Unix utilities.
 Their roles, tested versions, and known licensing information are recorded in
 `docs/DEPENDENCIES.md`.
 
-These dependencies are not currently vendored in this repository.
+The unmodified FFmpeg 9.0.1 source archive and its verification materials
+are intentionally vendored under `vendor/` to make the tested FFmpeg build
+reproducible from a self-contained checkout. The other dependencies listed
+above are not vendored.
 
 ## Third-party source audit
 
 A file-by-file dependency and provenance review was performed before the
 first release.
 
-The audit found no vendored third-party source code in the repository.
+The original project-source audit found no third-party source code
+incorporated into disc-archive-tools source files.
 
-A repository-wide search also found no third-party copyright notices, license
-notices, source URLs, GitHub references, SourceForge references, or Stack
-Overflow references in the project source files.
+The repository now intentionally contains the unmodified upstream FFmpeg 9.0.1
+source archive under `vendor/`, together with its detached signature and release
+signing key. This vendored upstream material is kept separate from the original
+disc-archive-tools source.
+
+A repository-wide search of the project source files also found no third-party
+copyright notices, license notices, source URLs, GitHub references, SourceForge
+references, or Stack Overflow references.
 
 This finding describes the repository and development history examined by the
 audit. It is not a claim that every individual expression in the project is
