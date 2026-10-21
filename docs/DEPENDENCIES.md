@@ -39,6 +39,9 @@ and enumerate playable menu PGC candidates.
 - License of tested build: GPL-2.0-or-later
 - Use: external `ffmpeg` and `ffprobe` executables
 - Not linked directly into disc-archive-tools code
+- The unmodified FFmpeg 9.0.1 source archive, detached signature, and release
+  signing key are vendored under `vendor/` so the tested build can be
+  reproduced without downloading FFmpeg source separately
 
 The tested FFmpeg build was configured as:
 
@@ -114,9 +117,12 @@ applicable.
 
 ## Dependency relationship
 
-disc-archive-tools currently contains no vendored copies of FFmpeg,
-libdvdread, libdvdnav, lsdvd, Bash, Python, GNU awk, GNU Make, GCC, or
-GNU coreutils.
+disc-archive-tools vendors the unmodified FFmpeg 9.0.1 source archive and
+its verification materials under `vendor/`. Compiled FFmpeg binaries are not
+vendored.
+
+The project does not vendor libdvdread, libdvdnav, lsdvd, Bash, Python,
+GNU awk, GNU Make, GCC, or GNU coreutils.
 
 The important dependency relationships are:
 
