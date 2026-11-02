@@ -179,7 +179,10 @@ int main(int argc, char **argv)
             ifo_handle_t *vts_ifo = ifoOpen(dvd, vts);
 
             if (!vts_ifo) {
-                continue;
+                fprintf(stderr, "Could not open VTS %u IFO; menu inventory incomplete.\n", vts);
+                ifoClose(vmg);
+                DVDClose(dvd);
+                return 1;
             }
 
             print_candidates(vts,

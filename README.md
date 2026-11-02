@@ -80,7 +80,46 @@ dvd-extract "/path/to/disc.iso" "/path/to/output"
 
 After extraction, the output is verified with `ffprobe` and a `manifest.json` file is created describing the extracted files.
 
-An interrupted extraction can be run again. Existing readable files are skipped, while missing or invalid files are extracted again.
+An interrupted extraction can be run again. Files are skipped only when a completion receipt matches both the DVD source fingerprint and the output SHA-256 checksum. Missing, changed, or unreceipted files are extracted again. Each extraction writes a temporary file and publishes the final MKV only after FFmpeg succeeds and the result can be probed. Existing archives without receipts must be re-extracted.
+
+## Command and source map
+
+The normal entry point is `dvd-extract`. It runs title extraction, menu
+extraction, and verification in sequence, stopping if any step fails.
+
+| Command | Purpose |
+| --- | --- |
+| `dvd-extract SOURCE [OUTPUT]` | Run the complete workflow; default output is `dvd-extract/`. |
+| `dvd-title-extract SOURCE [OUTPUT]` | Extract authored titles only; default output is `titles/`. |
+| `dvd-menu-extract SOURCE [OUTPUT]` | Extract playable menu content only; default output is `menus/`. |
+| `dvd-verify SOURCE OUTPUT` | Recheck an extraction and write `manifest.json`; requires the original source. |
+| `dvd-ifo-dump [--candidates] SOURCE` | Inspect DVD menu metadata; `--candidates` lists playable menu locations. |
+
+When running the title and menu commands separately, use `OUTPUT/titles` and
+`OUTPUT/menus` respectively so `dvd-verify SOURCE OUTPUT` can find them.
+Use a separate output directory for each disc. Unexpected MKVs are reported,
+not automatically deleted.
+
+The code is organized as follows:
+
+- `scripts/dvd-extract`: Bash orchestration for the complete workflow.
+- `scripts/dvd-title-extract`, `scripts/dvd-menu-extract`, and `scripts/dvd-verify`:
+  small Python entry points preserving the command names above.
+- `scripts/dvd-archive`: shared Python implementation for source fingerprints,
+  inventory discovery, extraction, completion receipts, and verification. It
+  must be installed alongside the entry points; the Makefile handles this.
+- `src/ifo_dump.c`: the libdvdread menu-inspection helper. `make` builds it as
+  `build-ifo-dump`; installation names it `dvd-ifo-dump`.
+- `tests/test_archive.py`: self-contained regression tests (`make test`).
+- `tests/test-dvd-extract.py` and `tests/fixtures/`: checks against manifests
+  from known DVD extractions (`make test-fixtures`).
+- `vendor/`: the pinned FFmpeg source archive and authentication materials.
+- `docs/DEPENDENCIES.md` and `docs/PROVENANCE.md`: dependency and source history.
+
+From a checkout, build the helper with `make`, then use
+`./scripts/dvd-extract SOURCE OUTPUT`. Installed commands require rebuilding
+and reinstalling after source changes. FFmpeg and ffprobe are currently
+expected under `/opt/ffmpeg-dvd/bin`.
 
 ## DVD-Video output
 
@@ -90,17 +129,21 @@ A DVD-Video extraction has this layout:
 output/
 ├── titles/
 │   ├── title_001.mkv
+│   ├── title_001.mkv.receipt.json
 │   ├── title_002.mkv
 │   └── ...
 ├── menus/
-│   ├── menu_vts_01_lu_01_pgc_001.mkv
+│   ├── vts_001_lu_001_pgc_001.mkv
+│   ├── vts_001_lu_001_pgc_001.mkv.receipt.json
 │   └── ...
 └── manifest.json
 ```
 
 The `titles` directory contains authored DVD titles. The `menus` directory contains playable menu content identified from the DVD structure.
 
-`manifest.json` records the extracted files and verification results, including available stream, codec, chapter, duration, language, audio, and video information.
+`manifest.json` (version 2) checks the expected title and menu inventory against the output, reports missing and unexpected files, and validates completion receipts and output checksums. Source discovery errors fail verification. It records the extracted files and verification results, including available stream, codec, chapter, duration, language, audio, and video information.
+
+Completion receipts (`*.mkv.receipt.json`) must be kept alongside their MKVs. Fingerprinting reads the entire ISO or all `.IFO`, `.BUP`, and `.VOB` files in `VIDEO_TS`; this adds disk I/O during extraction and verification. Keep the source unchanged while commands run. Verification establishes successful extraction and unchanged output; it does not perform a full decode or prove equivalence to every source packet.
 
 ## Preservation notes
 
@@ -118,9 +161,17 @@ Run the regression test suite from the repository root:
 make test
 ```
 
-The regression tests exercise DVD-Video extraction and verification against known test fixtures, including expected titles, menu content, streams, chapters, and durations.
+The self-contained tests exercise interrupted extraction, safe resume, discovery failures, source identity, and missing or altered outputs without DVD sources.
 
-The tests require access to the corresponding test DVD sources; the repository does not contain copyrighted audiovisual content.
+Check existing extraction manifests against the DVD regression fixtures separately:
+
+```bash
+make test-fixtures
+```
+
+The fixture checks cover expected titles, menu content, streams, chapters, and durations. They expect `test_dvd_extract/manifest.json` and `test_seinfeld_extract/manifest.json` from prior extractions; they do not run extraction themselves.
+
+Producing those extraction manifests requires access to the corresponding test DVD sources; the repository does not contain copyrighted audiovisual content.
 
 ## Legal and licensing
 

@@ -14,9 +14,9 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
 PROGRAM = build-ifo-dump
-SCRIPTS = scripts/dvd-title-extract scripts/dvd-menu-extract scripts/dvd-extract scripts/dvd-verify
+SCRIPTS = scripts/dvd-archive scripts/dvd-title-extract scripts/dvd-menu-extract scripts/dvd-extract scripts/dvd-verify
 
-.PHONY: all disc-archive-tools clean install install-disc-archive-tools uninstall test ffmpeg install-ffmpeg
+.PHONY: all disc-archive-tools clean install install-disc-archive-tools uninstall test test-fixtures ffmpeg install-ffmpeg
 
 all: disc-archive-tools
 
@@ -37,6 +37,7 @@ install-disc-archive-tools:
 	install -m 755 $(SCRIPTS) "$(DESTDIR)$(BINDIR)/"
 
 uninstall:
+	rm -f "$(DESTDIR)$(BINDIR)/dvd-archive"
 	rm -f \
 		"$(DESTDIR)$(BINDIR)/dvd-ifo-dump" \
 		"$(DESTDIR)$(BINDIR)/dvd-title-extract" \
@@ -45,6 +46,9 @@ uninstall:
 		"$(DESTDIR)$(BINDIR)/dvd-verify"
 
 test:
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
+
+test-fixtures:
 		tests/test-dvd-extract.py \
 		tests/fixtures/annette.json \
 		test_dvd_extract

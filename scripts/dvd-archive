@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Michael Stone
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Shared DVD extraction implementation; also installed alongside the commands."""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+FFMPEG = "/opt/ffmpeg-dvd/bin/ffmpeg"
+FFPROBE = "/opt/ffmpeg-dvd/bin/ffprobe"
+
+
+def digest(path):
+    result = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            result.update(block)
+    return result.hexdigest()
+
+
+def source_identity(source):
+    source = source.resolve(strict=True)
+    if source.is_file():
+        return {"type": "file", "sha256": digest(source)}
+    # Accept either a DVD directory or VIDEO_TS itself. Ignore unrelated files
+    # (including extraction outputs) so placing output beside VIDEO_TS is safe.
+    candidates = [source] if source.name.upper() == "VIDEO_TS" else [
+        p for p in source.iterdir() if p.is_dir() and p.name.upper() == "VIDEO_TS"
+    ]
+    if len(candidates) != 1:
+        raise ValueError("DVD directory must contain exactly one VIDEO_TS directory")
+    files = sorted((p for p in candidates[0].iterdir()
+                    if p.is_file() and p.suffix.upper() in {".IFO", ".BUP", ".VOB"}),
+                   key=lambda p: p.name)
+    if not files:
+        raise ValueError("No DVD files found in VIDEO_TS")
+    return {"type": "directory", "files": [
+        {"file": p.name, "sha256": digest(p)} for p in files
+    ]}
+
+
+def run(command):
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        raise ValueError(f"{command[0]} failed ({result.returncode}): {result.stderr.strip()}")
+    return result.stdout
+
+
+def ifo_tool():
+    local = Path(__file__).resolve().parent.parent / "build-ifo-dump"
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    installed = shutil.which("dvd-ifo-dump")
+    if not installed:
+        raise ValueError("dvd-ifo-dump not found; build or install disc-archive-tools")
+    return installed
+
+
+def inventory(source, kind):
+    if kind == "title":
+        output = run(["lsdvd", str(source)])
+        titles = [int(n) for n in re.findall(r"^\s*Title:\s*(\d+)\b", output, re.M)]
+        if not titles or len(set(titles)) != len(titles) or min(titles) < 1:
+            raise ValueError("Could not determine a unique DVD title inventory")
+        return {f"title_{n:03d}.mkv": ["-title", str(n), "-trim", "0", "-preindex", "1"]
+                for n in titles}
+    output = run([ifo_tool(), "--candidates", str(source)])
+    result = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != 3 or not all(s.isdecimal() for s in fields):
+            raise ValueError(f"Invalid menu candidate: {line!r}")
+        vts, lu, pgc = map(int, fields)
+        if lu < 1 or pgc < 1:
+            raise ValueError(f"Invalid menu candidate: {line!r}")
+        name = f"vts_{vts:03d}_lu_{lu:03d}_pgc_{pgc:03d}.mkv"
+        if name in result:
+            raise ValueError(f"Duplicate menu candidate: {line!r}")
+        result[name] = ["-menu", "1", "-menu_vts", str(vts), "-menu_lu", str(lu), "-pgc", str(pgc)]
+    return result
+
+
+def atomic_json(path, data):
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def receipt_path(path):
+    return path.with_name(path.name + ".receipt.json")
+
+
+def receipt_valid(path, identity):
+    try:
+        receipt = json.loads(receipt_path(path).read_text())
+        return (receipt.get("version") == 1 and receipt.get("source") == identity
+                and receipt.get("file") == path.name
+                and receipt.get("sha256") == digest(path))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def probe(path):
+    data = json.loads(run([FFPROBE, "-v", "error", "-show_format", "-show_streams",
+                           "-show_chapters", "-of", "json", str(path)]))
+    streams = []
+    for stream in data.get("streams", []):
+        item = {k: stream.get(k) for k in ("index", "codec_type", "codec_name")}
+        if stream.get("codec_type") == "video":
+            item.update({k: stream.get(k) for k in ("width", "height")})
+        if stream.get("codec_type") == "audio":
+            item.update({k: stream.get(k) for k in ("sample_rate", "channels")})
+        item.update({k: v for k, v in stream.get("tags", {}).items() if k in {"language", "title"}})
+        streams.append(item)
+    if not any(s["codec_type"] == "video" for s in streams):
+        raise ValueError("No video stream found")
+    try:
+        duration = float(data.get("format", {}).get("duration"))
+    except (TypeError, ValueError):
+        duration = None
+    return {"verified": True, "duration": duration,
+            "chapter_count": len(data.get("chapters", [])), "streams": streams}
+
+
+def extract(source, out, kind):
+    identity = source_identity(source)
+    expected = inventory(source, kind)
+    out.mkdir(parents=True, exist_ok=True)
+    # Lock the directory inode rather than creating a replaceable lock file.
+    fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for name, options in expected.items():
+            path = out / name
+            if receipt_valid(path, identity):
+                print(f"Completed extraction matches source and checksum; skipping {path}")
+                continue
+            temp_fd, temp_name = tempfile.mkstemp(prefix=f".{name}.", suffix=".part", dir=out)
+            os.close(temp_fd)
+            temporary = Path(temp_name)
+            try:
+                # Explicit format is necessary because the temporary suffix is .part.
+                command = [FFMPEG, "-nostdin", "-y", "-f", "dvdvideo", *options,
+                           "-i", str(source), "-map", "0", "-c", "copy", "-f", "matroska", str(temporary)]
+                subprocess.run(command, check=True)
+                probe(temporary)
+                checksum = digest(temporary)
+                with temporary.open("rb") as handle:
+                    os.fsync(handle.fileno())
+                # Invalidate any previous completion record before publishing.
+                receipt_path(path).unlink(missing_ok=True)
+                os.replace(temporary, path)
+                atomic_json(receipt_path(path), {"version": 1, "source": identity,
+                                                "file": name, "sha256": checksum})
+            finally:
+                temporary.unlink(missing_ok=True)
+    finally:
+        os.close(fd)
+
+
+def verify(source, root):
+    if not root.is_dir():
+        raise ValueError(f"Not a directory: {root}")
+    identity = source_identity(source)
+    expected = {}
+    for kind, directory in (("title", "titles"), ("menu", "menus")):
+        expected.update({f"{directory}/{name}": kind for name in inventory(source, kind)})
+    actual = {str(p.relative_to(root)) for directory in ("titles", "menus")
+              for p in (root / directory).glob("*.mkv")}
+    entries = []
+    for name in sorted(set(expected) | actual):
+        path = root / name
+        entry = {"file": name, "kind": expected.get(name, "unknown"), "verified": False}
+        try:
+            if name not in expected:
+                raise ValueError("Unexpected file: absent from source inventory")
+            if not path.is_file():
+                raise ValueError("Expected file is missing")
+            if not receipt_valid(path, identity):
+                raise ValueError("Missing or invalid completion receipt, source mismatch, or checksum mismatch; re-extract")
+            entry.update(probe(path))
+            entry["sha256"] = digest(path)
+        except (OSError, ValueError) as exc:
+            entry["error"] = str(exc)
+        entries.append(entry)
+        print(f"{name}: {'verified' if entry['verified'] else entry['error']}", file=sys.stderr)
+    failures = sum(not e["verified"] for e in entries)
+    manifest = {"format": "disc-archive-tools dvd-video manifest", "version": 2,
+                "source": {"path": str(source.resolve()), **identity}, "files": entries,
+                "summary": {"files": len(entries), "verified": len(entries) - failures, "failed": failures}}
+    atomic_json(root / "manifest.json", manifest)
+    return 1 if failures or not expected else 0
+
+
+def main(mode=None):
+    args = sys.argv[1:]
+    if mode is None:
+        if not args:
+            print("Usage: dvd-archive <title|menu|verify> <source> [output]", file=sys.stderr)
+            return 1
+        mode, *args = args
+    if mode not in {"title", "menu", "verify"} or len(args) not in ({2} if mode == "verify" else {1, 2}):
+        print("Usage: <command> <dvd.iso|dvd-directory> [output-directory]", file=sys.stderr)
+        return 1
+    source = Path(args[0]).resolve()
+    out = Path(args[1] if len(args) == 2 else {"title": "titles", "menu": "menus"}[mode]).resolve()
+    try:
+        if mode == "verify":
+            return verify(source, out)
+        extract(source, out, mode)
+        return 0
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
