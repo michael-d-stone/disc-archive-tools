@@ -152,13 +152,24 @@ def extract(source, out, kind):
             if receipt_valid(path, identity):
                 print(f"Completed extraction matches source and checksum; skipping {path}")
                 continue
+            input_args = ["-f", "dvdvideo", *options]
+            # Stream metadata needs no chapter index. Leave indexing to extraction.
+            streams = json.loads(run([FFPROBE, "-v", "error", *input_args, "-preindex", "0",
+                                      "-show_entries", "stream=index,codec_name,sample_fmt",
+                                      "-of", "json", str(source)]))["streams"]
+            codecs = ["-c", "copy"]
+            for stream in streams:
+                if stream.get("codec_name") == "pcm_dvd":
+                    # DVD LPCM uses 16, 20, or 24 bits. Matroska accepts linear PCM.
+                    codec = "pcm_s16le" if stream.get("sample_fmt") == "s16" else "pcm_s24le"
+                    codecs.extend([f"-c:{stream['index']}", codec])
             temp_fd, temp_name = tempfile.mkstemp(prefix=f".{name}.", suffix=".part", dir=out)
             os.close(temp_fd)
             temporary = Path(temp_name)
             try:
                 # Explicit format is necessary because the temporary suffix is .part.
-                command = [FFMPEG, "-nostdin", "-y", "-f", "dvdvideo", *options,
-                           "-i", str(source), "-map", "0", "-c", "copy", "-f", "matroska", str(temporary)]
+                command = [FFMPEG, "-nostdin", "-y", *input_args,
+                           "-i", str(source), "-map", "0", *codecs, "-f", "matroska", str(temporary)]
                 subprocess.run(command, check=True)
                 probe(temporary)
                 checksum = digest(temporary)

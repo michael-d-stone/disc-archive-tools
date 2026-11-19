@@ -36,9 +36,26 @@ class ArchiveTests(unittest.TestCase):
 
     def extract(self, ffmpeg=None):
         with patch.object(archive, 'inventory', return_value=self.options), \
+             patch.object(archive, 'run', return_value='{"streams": []}'), \
              patch.object(archive.subprocess, 'run', side_effect=ffmpeg or self.fake_ffmpeg), \
              patch.object(archive, 'probe', return_value={'verified': True}):
             archive.extract(self.source, self.titles, 'title')
+
+    def test_only_dvd_pcm_streams_use_lossless_pcm_conversion(self):
+        streams = [
+            {"index": 0, "codec_name": "mpeg2video"},
+            {"index": 1, "codec_name": "pcm_dvd", "sample_fmt": "s16"},
+            {"index": 2, "codec_name": "ac3"},
+            {"index": 3, "codec_name": "pcm_dvd", "sample_fmt": "s32"},
+        ]
+        with patch.object(archive, 'inventory', return_value=self.options), \
+             patch.object(archive, 'run', return_value=json.dumps({"streams": streams})), \
+             patch.object(archive.subprocess, 'run', side_effect=self.fake_ffmpeg), \
+             patch.object(archive, 'probe'):
+            archive.extract(self.source, self.titles, 'title')
+        self.assertEqual(self.calls[0][-9:-3], [
+            "-c", "copy", "-c:1", "pcm_s16le", "-c:3", "pcm_s24le",
+        ])
 
     def inventories(self, source, kind):
         return self.options if kind == 'title' else {'vts_000_lu_001_pgc_001.mkv': []}
@@ -80,6 +97,7 @@ class ArchiveTests(unittest.TestCase):
 
     def test_successful_ffmpeg_with_invalid_output_does_not_publish(self):
         with patch.object(archive, 'inventory', return_value=self.options), \
+             patch.object(archive, 'run', return_value='{"streams": []}'), \
              patch.object(archive.subprocess, 'run', side_effect=self.fake_ffmpeg), \
              patch.object(archive, 'probe', side_effect=ValueError('invalid media')):
             with self.assertRaises(ValueError):

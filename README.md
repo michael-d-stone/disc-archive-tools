@@ -76,7 +76,7 @@ To choose the output directory explicitly:
 dvd-extract "/path/to/disc.iso" "/path/to/output"
 ```
 
-`dvd-extract` extracts all authored DVD titles and playable menu content without re-encoding. Output is written as Matroska (`.mkv`) files.
+`dvd-extract` extracts all authored DVD titles and playable menu content to Matroska (`.mkv`) files. DVD LPCM audio is converted losslessly to Matroska-compatible PCM. All other streams are copied.
 
 After extraction, the output is verified with `ffprobe` and a `manifest.json` file is created describing the extracted files.
 
