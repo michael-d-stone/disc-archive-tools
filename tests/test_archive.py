@@ -1,6 +1,8 @@
 # Copyright (C) 2026 Michael Stone
 # SPDX-License-Identifier: GPL-2.0-or-later
 import importlib.machinery
+import contextlib
+import io
 import importlib.util
 import json
 from pathlib import Path
@@ -61,10 +63,13 @@ class ArchiveTests(unittest.TestCase):
         return self.options if kind == 'title' else {'vts_000_lu_001_pgc_001.mkv': []}
 
     def verify(self):
+        output = io.StringIO()
         with patch.object(archive, 'inventory', side_effect=self.inventories), \
-             patch.object(archive, 'probe', return_value={'verified': True}):
+             patch.object(archive, 'probe', return_value={'verified': True}), \
+             contextlib.redirect_stdout(output):
             status = archive.verify(self.source, self.out)
-        return status, json.loads((self.out / 'manifest.json').read_text())
+        path = Path(output.getvalue().strip().removeprefix('Verification result: '))
+        return status, json.loads(path.read_text())
 
     def test_resume_requires_completed_receipt_and_checksum(self):
         self.titles.mkdir(parents=True)
@@ -140,6 +145,21 @@ class ArchiveTests(unittest.TestCase):
              patch.object(archive, 'probe', return_value={'verified': True}):
             self.assertEqual(archive.verify(self.source, self.out), 0)
         self.assertEqual(json.loads((self.out / 'manifest.json').read_text())['summary']['failed'], 0)
+
+    def test_repeat_verification_preserves_original_and_collision_results(self):
+        self.extract()
+        self.verify()
+        original = (self.out / 'manifest.json').read_bytes()
+        self.source.write_bytes(b'changed')
+        with patch.object(archive, 'datetime') as clock:
+            clock.now.return_value.strftime.return_value = '2026-01-02-030405-UTC'
+            status, result = self.verify()
+            self.assertEqual(status, 1)
+            self.assertGreater(result['summary']['failed'], 0)
+            self.verify()
+        self.assertEqual((self.out / 'manifest.json').read_bytes(), original)
+        self.assertTrue((self.out / 'verified-2026-01-02-030405-UTC.json').is_file())
+        self.assertTrue((self.out / 'verified-2026-01-02-030405-UTC-1.json').is_file())
 
     def test_actual_title_numbers_are_preserved(self):
         with patch.object(archive, 'run', return_value='Title: 01, Length: x\nTitle: 03, Length: y\n'):

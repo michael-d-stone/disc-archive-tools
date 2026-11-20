@@ -78,7 +78,7 @@ dvd-extract "/path/to/disc.iso" "/path/to/output"
 
 `dvd-extract` extracts all authored DVD titles and playable menu content to Matroska (`.mkv`) files. DVD LPCM audio is converted losslessly to Matroska-compatible PCM. All other streams are copied.
 
-After extraction, the output is verified with `ffprobe` and a `manifest.json` file is created describing the extracted files.
+After extraction, the output is verified with `ffprobe` and a `manifest.json` file is created describing the extracted files. Later verification runs preserve that original and write a new `verified-YYYY-MM-DD-HHMMSS-UTC.json` file in the output directory, with a numeric suffix if needed. The command prints the result path, including for failed checks.
 
 An interrupted extraction can be run again. Files are skipped only when a completion receipt matches both the DVD source fingerprint and the output SHA-256 checksum. Missing, changed, or unreceipted files are extracted again. Each extraction writes a temporary file and publishes the final MKV only after FFmpeg succeeds and the result can be probed. Existing archives without receipts must be re-extracted.
 

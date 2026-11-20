@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Shared DVD extraction implementation; also installed alongside the commands."""
 import fcntl
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -102,6 +103,33 @@ def atomic_json(path, data):
     finally:
         temporary.unlink(missing_ok=True)
 
+
+
+def publish_manifest(root, data):
+    """Publish a complete manifest without replacing any existing file."""
+    fd, name = tempfile.mkstemp(prefix=".manifest.", dir=root)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S-UTC")
+        index = 0
+        while True:
+            if index == 0:
+                target = root / "manifest.json"
+            else:
+                suffix = "" if index == 1 else f"-{index - 1}"
+                target = root / f"verified-{stamp}{suffix}.json"
+            try:
+                os.link(temporary, target)
+                return target
+            except FileExistsError:
+                index += 1
+    finally:
+        temporary.unlink(missing_ok=True)
 
 def receipt_path(path):
     return path.with_name(path.name + ".receipt.json")
@@ -216,7 +244,8 @@ def verify(source, root):
     manifest = {"format": "disc-archive-tools dvd-video manifest", "version": 2,
                 "source": {"path": str(source.resolve()), **identity}, "files": entries,
                 "summary": {"files": len(entries), "verified": len(entries) - failures, "failed": failures}}
-    atomic_json(root / "manifest.json", manifest)
+    path = publish_manifest(root, manifest)
+    print(f"Verification result: {path}")
     return 1 if failures or not expected else 0
 
 

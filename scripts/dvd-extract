@@ -74,6 +74,3 @@ echo "  $OUT/titles"
 echo
 echo "Menus:"
 echo "  $OUT/menus"
-echo
-echo "Manifest:"
-echo "  $OUT/manifest.json"
