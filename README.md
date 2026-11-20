@@ -16,11 +16,11 @@ Current support:
 
 Planned support includes:
 
+- Blu-ray (next format)
 - Audio CD
 - Video CD (VCD)
 - Super Video CD (SVCD)
 - DVD-Audio
-- Blu-ray
 
 
 ## Building on Debian 12
