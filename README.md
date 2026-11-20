@@ -82,6 +82,25 @@ After extraction, the output is verified with `ffprobe` and a `manifest.json` fi
 
 An interrupted extraction can be run again. Files are skipped only when a completion receipt matches both the DVD source fingerprint and the output SHA-256 checksum. Missing, changed, or unreceipted files are extracted again. Each extraction writes a temporary file and publishes the final MKV only after FFmpeg succeeds and the result can be probed. Existing archives without receipts must be re-extracted.
 
+### Optional FLAC conversion after archiving
+
+After verification, you can make a separate MKV with losslessly compressed FLAC
+audio. Use a destination outside the verified archive so its checksums and
+completion receipts remain valid.
+
+```bash
+input="/path/to/archive/titles/title_002.mkv"
+/opt/ffmpeg-dvd/bin/ffprobe -v error -select_streams a \
+  -show_entries stream=index,codec_name -of compact "$input"
+
+# Example for a PCM track whose stream index is 1.
+/opt/ffmpeg-dvd/bin/ffmpeg -n -i "$input" -map 0 -c copy -c:1 flac \
+  "/path/to/converted/title_002.mkv"
+```
+
+Use the reported index for each `pcm_s16le` or `pcm_s24le` track you want to
+convert. Add a separate `-c:<index> flac` for each selected track.
+
 ## Command and source map
 
 The normal entry point is `dvd-extract`. It runs title extraction, menu
