@@ -14,22 +14,24 @@ Queens 11. All passed the current inventory, receipt, checksum, and media-probe
 checks. The original manifests were preserved and timestamped results saved.
 Passing these checks does not establish full content preservation or playback.
 
-### Investigate disc 2 galleries — open
+### Interactive still gallery export — implemented
 
-Asa Akira Is Pure disc 2 titles 7–17 have far fewer extracted video packets and
-chapter markers than their authored durations and chapter counts suggest. They
-appear to be still-image galleries. The updated verifier flagged all 11 as
-incomplete in a staging copy. Gallery recovery remains open.
-Keep the original ISO and extraction. Record what a DVD player displays and in
-what order, then compare that record with the authored durations and chapters,
-the DVD reader's packet output, and the current MKVs.
+Asa Akira Is Pure Disc 2 titles 7–17 use DVD navigation instructions to
+hold still frames indefinitely. `dvd-extract` now identifies these titles,
+prints the `dvd-gallery-extract` commands, and continues with the ordinary
+titles and menus. The offline browser exports preserve the stills, chapter
+navigation, and cross-title jumps. Exits to DVD menus identify their
+destination on screen.
 
-Use the comparison to choose a preservation format. This milestone is complete
-when the preserved output accounts for each observed gallery item in order,
-verification flags incomplete galleries separately from receipt or checksum
-failures, and any unsupported behavior is documented. Add regression coverage
-for a complete gallery, an incomplete gallery, and an ordinary motion-video
-title.
+All 11 galleries passed source-based verification in staging. Their Next
+and Previous paths matched continuous DVD navigation, and an offline
+browser test confirmed that a still waits for input. The full staging
+archive verified all 71 entries. The original ISO and archive were untouched.
+
+Possible follow-up work includes supporting timed stills and on-screen DVD
+buttons, and testing those behaviors on discs authored differently. A
+desktop-player comparison is still open because mpv skipped the source
+disc's holds during testing.
 
 ## Blu-ray — next format
 
