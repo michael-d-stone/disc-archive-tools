@@ -195,7 +195,7 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(set(archive.inventory(self.source, 'title')),
                              {'title_001.mkv', 'title_003.mkv'})
 
-    def test_short_legacy_title_fails_verification_and_is_retried(self):
+    def test_short_legacy_title_fails_verification_and_recovers(self):
         self.extract()
         path = self.titles / 'title_001.mkv'
         identity = archive.source_identity(self.source)
@@ -208,15 +208,37 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(entry['expected'], {'duration': 60.0, 'chapter_count': 2})
         self.assertEqual(json.loads(archive.receipt_path(path).read_text())['status'], 'incomplete')
 
-        with self.assertRaisesRegex(ValueError, 'Expected 60.000s'):
-            self.extract()
-        self.assertEqual(len(self.calls), 2)
+        with patch.object(archive, 'inventory', return_value=self.options), \
+             patch.object(archive, 'remux_dvd'), \
+             patch.object(archive, 'probe', side_effect=[
+                 self.media, self.media, {'duration': 60.0, 'chapter_count': 2}]), \
+             patch.object(archive, 'recover_chapters') as recover:
+            archive.extract(self.source, self.titles, 'title')
+        recover.assert_called_once()
+        self.assertEqual(json.loads(archive.receipt_path(path).read_text())['status'], 'complete')
+        self.media = {'verified': True, 'duration': 60.0, 'chapter_count': 2}
+        _, manifest = self.verify()
+        self.assertTrue(next(e for e in manifest['files'] if e['kind'] == 'title')['verified'])
 
     def test_complete_runtime_with_missing_chapter_marker_is_incomplete(self):
         check = archive.completeness((1, 60.0, [10.0, 50.0]), {
             'duration': 60.0, 'chapter_count': 1,
         })
         self.assertIn('error', check)
+
+    def test_failed_chapter_retry_preserves_incomplete_title(self):
+        self.extract()
+        path = self.titles / 'title_001.mkv'
+        original = path.read_bytes()
+        self.options[path.name] = (1, 60.0, [10.0, 50.0])
+        with patch.object(archive, 'inventory', return_value=self.options), \
+             patch.object(archive, 'remux_dvd', side_effect=[None, ValueError('bad chapter')]), \
+             patch.object(archive, 'probe', return_value=self.media):
+            with self.assertRaisesRegex(ValueError, 'chapter 1'):
+                archive.extract(self.source, self.titles, 'title')
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(json.loads(archive.receipt_path(path).read_text())['status'], 'incomplete')
+        self.assertEqual(set(self.titles.iterdir()), {path, archive.receipt_path(path)})
 
     def test_directory_fingerprint_tracks_dvd_content_only(self):
         dvd = self.root / 'folder'

@@ -257,6 +257,61 @@ def remux_dvd(source, options, destination):
                     "-f", "matroska", str(destination)], check=True)
 
 
+def packet_counts(path):
+    data = json.loads(run([FFPROBE, "-v", "error", "-count_packets",
+                           "-show_entries", "stream=index,nb_read_packets",
+                           "-of", "json", str(path)]))
+    return {stream["index"]: int(stream.get("nb_read_packets", 0))
+            for stream in data["streams"]}
+
+
+def recover_chapters(source, title, destination):
+    number, _, chapters = title
+    with tempfile.TemporaryDirectory(prefix=".chapters-", dir=destination.parent) as directory:
+        work = Path(directory)
+        concat = ["ffconcat version 1.0"]
+        metadata = [";FFMETADATA1"]
+        elapsed = 0
+        streams = None
+        expected_packets = {}
+        for chapter, expected in enumerate(chapters, 1):
+            segment = work / f"{chapter:03d}.mkv"
+            options = ["-title", str(number), "-trim", "0", "-preindex", "0",
+                       "-chapter_start", str(chapter), "-chapter_end", str(chapter)]
+            try:
+                remux_dvd(source, options, segment)
+                observed = probe(segment)
+                duration = observed["duration"]
+                if not duration_matches(expected, duration) or duration <= 0:
+                    raise ValueError(f"expected {expected:.3f}s, found {duration}s")
+                if streams is not None and streams != observed["streams"]:
+                    raise ValueError("stream layout differs from the first chapter")
+                streams = observed["streams"]
+                for index, count in packet_counts(segment).items():
+                    expected_packets[index] = expected_packets.get(index, 0) + count
+            except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+                raise ValueError(f"Title {number}, chapter {chapter}: {exc}") from exc
+            milliseconds = round(duration * 1000)
+            concat.extend([f"file {segment.name}", f"duration {milliseconds / 1000:.3f}"])
+            metadata.extend(["[CHAPTER]", "TIMEBASE=1/1000",
+                             f"START={elapsed}", f"END={elapsed + milliseconds}"])
+            elapsed += milliseconds
+
+        (work / "chapters.ffconcat").write_text("\n".join(concat) + "\n")
+        (work / "chapters.ffmetadata").write_text("\n".join(metadata) + "\n")
+        try:
+            subprocess.run([FFMPEG, "-nostdin", "-xerror", "-abort_on", "empty_output", "-y",
+                            "-f", "concat", "-i", str(work / "chapters.ffconcat"),
+                            "-f", "ffmetadata", "-i", str(work / "chapters.ffmetadata"),
+                            "-map", "0", "-map_chapters", "1", "-c", "copy",
+                            "-f", "matroska", str(destination)], check=True)
+        except subprocess.CalledProcessError as exc:
+            raise ValueError(f"Title {number}: failed to join chapter segments") from exc
+        if packet_counts(destination) != expected_packets:
+            raise ValueError(f"Title {number}: packet counts changed during chapter join")
+        print(f"Title {number}: chapter join preserved packet counts {expected_packets}")
+
+
 def extract(source, out, kind):
     identity = source_identity(source)
     expected = inventory(source, kind)
@@ -290,6 +345,10 @@ def extract(source, out, kind):
                 remux_dvd(source, options, temporary)
                 observed = probe(temporary)
                 check = completeness(title, observed) if title else None
+                if check and "error" in check and len(title[2]) > 1:
+                    print(f"{name}: {check['error']}. Retrying by chapter.", file=sys.stderr)
+                    recover_chapters(source, title, temporary)
+                    check = completeness(title, probe(temporary))
                 if check and "error" in check:
                     raise ValueError(f"{name}: {check['error']}")
                 checksum = digest(temporary)
