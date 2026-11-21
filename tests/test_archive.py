@@ -38,7 +38,7 @@ class ArchiveTests(unittest.TestCase):
 
     def extract(self, ffmpeg=None):
         with patch.object(archive, 'inventory', return_value=self.options), \
-             patch.object(archive, 'run', return_value='{"streams": []}'), \
+             patch.object(archive, 'probe_dvd_streams', return_value=[]), \
              patch.object(archive.subprocess, 'run', side_effect=ffmpeg or self.fake_ffmpeg), \
              patch.object(archive, 'probe', return_value={'verified': True}):
             archive.extract(self.source, self.titles, 'title')
@@ -51,13 +51,24 @@ class ArchiveTests(unittest.TestCase):
             {"index": 3, "codec_name": "pcm_dvd", "sample_fmt": "s32"},
         ]
         with patch.object(archive, 'inventory', return_value=self.options), \
-             patch.object(archive, 'run', return_value=json.dumps({"streams": streams})), \
+             patch.object(archive, 'probe_dvd_streams', return_value=streams), \
              patch.object(archive.subprocess, 'run', side_effect=self.fake_ffmpeg), \
              patch.object(archive, 'probe'):
             archive.extract(self.source, self.titles, 'title')
         self.assertEqual(self.calls[0][-9:-3], [
             "-c", "copy", "-c:1", "pcm_s16le", "-c:3", "pcm_s24le",
         ])
+
+    def test_dvd_probe_reads_json_separately_from_stdout_diagnostics(self):
+        streams = [{"index": 0, "codec_name": "mpeg2video"}]
+
+        def noisy_probe(command, **kwargs):
+            report = Path(command[command.index("-o") + 1])
+            report.write_text(json.dumps({"streams": streams}))
+            return subprocess.CompletedProcess(command, 0, "libdvdread: CHECK_VALUE failed\n", "")
+
+        with patch.object(archive.subprocess, 'run', side_effect=noisy_probe):
+            self.assertEqual(archive.probe_dvd_streams(self.source, ["-f", "dvdvideo"]), streams)
 
     def inventories(self, source, kind):
         return self.options if kind == 'title' else {'vts_000_lu_001_pgc_001.mkv': []}
@@ -102,7 +113,7 @@ class ArchiveTests(unittest.TestCase):
 
     def test_successful_ffmpeg_with_invalid_output_does_not_publish(self):
         with patch.object(archive, 'inventory', return_value=self.options), \
-             patch.object(archive, 'run', return_value='{"streams": []}'), \
+             patch.object(archive, 'probe_dvd_streams', return_value=[]), \
              patch.object(archive.subprocess, 'run', side_effect=self.fake_ffmpeg), \
              patch.object(archive, 'probe', side_effect=ValueError('invalid media')):
             with self.assertRaises(ValueError):
@@ -116,6 +127,21 @@ class ArchiveTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '23'):
                 archive.extract(self.source, self.out / 'menus', 'menu')
         self.assertFalse((self.out / 'menus').exists())
+
+    def test_menu_inventory_preserves_diagnostics_and_rejects_bad_records(self):
+        warning = 'libdvdread: C_ADT nr_of_vobs > available info entries'
+        diagnostics = io.StringIO()
+        with patch.object(archive, 'ifo_tool', return_value='dvd-ifo-dump'), \
+             patch.object(archive, 'run', side_effect=[
+                 f'1 1 9\n{warning}\n1 1 10\n',
+                 f'{warning}\n1 1 invalid\n',
+             ]), contextlib.redirect_stderr(diagnostics):
+            self.assertEqual(list(archive.inventory(self.source, 'menu')), [
+                'vts_001_lu_001_pgc_009.mkv', 'vts_001_lu_001_pgc_010.mkv',
+            ])
+            with self.assertRaisesRegex(ValueError, 'Invalid menu candidate'):
+                archive.inventory(self.source, 'menu')
+        self.assertEqual(diagnostics.getvalue().splitlines(), [warning, warning])
 
     def test_missing_and_unexpected_files_fail_verification(self):
         self.extract()

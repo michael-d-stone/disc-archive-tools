@@ -54,6 +54,16 @@ def run(command):
     return result.stdout
 
 
+def probe_dvd_streams(source, input_args):
+    # libdvdread can write diagnostics directly to stdout, interleaving with JSON.
+    with tempfile.TemporaryDirectory() as directory:
+        report = Path(directory) / "streams.json"
+        run([FFPROBE, "-v", "error", *input_args, "-preindex", "0",
+             "-show_entries", "stream=index,codec_name,sample_fmt",
+             "-of", "json", "-o", str(report), str(source)])
+        return json.loads(report.read_text(encoding="utf-8"))["streams"]
+
+
 def ifo_tool():
     local = Path(__file__).resolve().parent.parent / "build-ifo-dump"
     if local.is_file() and os.access(local, os.X_OK):
@@ -76,6 +86,9 @@ def inventory(source, kind):
     result = {}
     for line in output.splitlines():
         if not line.strip():
+            continue
+        if line.startswith("libdvdread:"):
+            print(line, file=sys.stderr)
             continue
         fields = line.split()
         if len(fields) != 3 or not all(s.isdecimal() for s in fields):
@@ -182,9 +195,7 @@ def extract(source, out, kind):
                 continue
             input_args = ["-f", "dvdvideo", *options]
             # Stream metadata needs no chapter index. Leave indexing to extraction.
-            streams = json.loads(run([FFPROBE, "-v", "error", *input_args, "-preindex", "0",
-                                      "-show_entries", "stream=index,codec_name,sample_fmt",
-                                      "-of", "json", str(source)]))["streams"]
+            streams = probe_dvd_streams(source, input_args)
             codecs = ["-c", "copy"]
             for stream in streams:
                 if stream.get("codec_name") == "pcm_dvd":
