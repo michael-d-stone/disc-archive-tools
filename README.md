@@ -82,6 +82,22 @@ After extraction, the output is verified with `ffprobe` and a `manifest.json` fi
 
 An interrupted extraction can be run again. Files are skipped only when a completion receipt matches both the DVD source fingerprint and the output SHA-256 checksum. Missing, changed, or unreceipted files are extracted again. Each extraction writes a temporary file and publishes the final MKV only after FFmpeg succeeds and the result can be probed. Title checks also compare the MKV runtime and chapter count against the authored DVD metadata. A single-chapter title may use the whole MKV as its implicit chapter. A checksummed title that falls short is recorded as incomplete and retried. When the whole-title read returns an incomplete multi-chapter MKV, extraction retries with bounded chapter reads and checks packet counts across the join. Existing archives without receipts must be re-extracted.
 
+### Interactive still galleries
+
+When a DVD title uses indefinite stills, `dvd-extract` prints the command to
+export it and continues extracting the remaining titles and menus. Run the
+printed `dvd-gallery-extract` command, then open the resulting `index.html`
+in a browser. Keep the page, PNGs, and gallery manifest together. The page
+holds each image until you use an available DVD chapter or menu control.
+Links between gallery titles follow the disc. An exit to a DVD menu identifies
+the destination on screen. Use the source DVD or ISO to play that menu.
+
+Run `dvd-verify SOURCE OUTPUT` again after exporting. It checks the gallery
+images and navigation against the source and reports unexported galleries as
+pending. The exporter supports indefinite stills with chapter controls and
+menu exits. It reports unsupported on-screen DVD buttons and other still
+behavior rather than substituting a slideshow.
+
 ### Optional FLAC conversion after archiving
 
 After verification, you can make a separate MKV with losslessly compressed FLAC

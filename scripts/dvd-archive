@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import math
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -516,6 +517,11 @@ def gallery_destination(root, title):
     return root / "galleries" / f"title_{title:03d}"
 
 
+def gallery_command(source, destination, title):
+    executable = Path(__file__).resolve().with_name("dvd-gallery-extract")
+    return shlex.join([str(executable), str(source), str(title), str(destination)])
+
+
 def extract_gallery(source, title, destination):
     identity = source_identity(source)
     graph = gallery_graph(source, title, confirmed_galleries(source), {})
@@ -554,6 +560,7 @@ def publish_gallery(source, title, destination, identity, graph):
 def extract(source, out, kind):
     identity = source_identity(source)
     expected = inventory(source, kind)
+    galleries = confirmed_galleries(source) if kind == "title" else {}
     out.mkdir(parents=True, exist_ok=True)
     fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -561,6 +568,12 @@ def extract(source, out, kind):
         for name, item in expected.items():
             path = out / name
             title = item if kind == "title" else None
+            if title and title[0] in galleries:
+                destination = gallery_destination(out.parent, title[0])
+                if not (destination / "manifest.json").is_file():
+                    print(f"Title {title[0]} is an interactive still gallery. Export it with:\n"
+                          f"  {gallery_command(source, destination, title[0])}")
+                continue
             receipt = matching_receipt(path, identity)
             if receipt is not None:
                 check = None
@@ -606,12 +619,20 @@ def verify(source, root):
     if not root.is_dir():
         raise ValueError(f"Not a directory: {root}")
     identity = source_identity(source)
+    galleries = confirmed_galleries(source)
+    trace_cache = {}
     expected = {}
     for kind, directory in (("title", "titles"), ("menu", "menus")):
         expected.update({f"{directory}/{name}": (kind, item)
                          for name, item in inventory(source, kind).items()})
     actual = {str(p.relative_to(root)) for directory in ("titles", "menus")
               for p in (root / directory).glob("*.mkv")}
+    for number in galleries:
+        mkv = f"titles/title_{number:03d}.mkv"
+        expected.pop(mkv, None)
+        actual.discard(mkv)
+        index = gallery_destination(root, number) / "index.html"
+        expected[str(index.relative_to(root))] = ("gallery", number)
     entries = []
     for name in sorted(set(expected) | actual):
         path = root / name
@@ -619,6 +640,18 @@ def verify(source, root):
         try:
             if name not in expected:
                 raise ValueError("Unexpected file: absent from source inventory")
+            kind, item = expected[name]
+            if kind == "gallery":
+                if not (path.parent / "manifest.json").is_file():
+                    entry["status"] = "pending"
+                    entry["command"] = gallery_command(source, path.parent, item)
+                    raise ValueError(f"Gallery export pending. Run: {entry['command']}")
+                graph = gallery_graph(source, item, galleries, trace_cache)
+                entry["image_count"] = verify_gallery(path.parent, identity, item, graph)
+                entry["verified"] = True
+                print(f"{name}: verified. Open {path}", file=sys.stderr)
+                entries.append(entry)
+                continue
             if not path.is_file():
                 raise ValueError("Expected file is missing")
             fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
@@ -629,7 +662,6 @@ def verify(source, root):
                     raise ValueError("Missing or invalid completion receipt, source mismatch, or checksum mismatch; re-extract")
                 entry.update(probe(path))
                 entry["sha256"] = receipt["sha256"]
-                kind, item = expected[name]
                 if kind == "title":
                     check = completeness(item, entry)
                     entry.update(check)

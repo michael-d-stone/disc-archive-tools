@@ -28,6 +28,9 @@ class ArchiveTests(unittest.TestCase):
         self.source.write_bytes(b'disc one')
         self.out = self.root / 'output'
         self.titles = self.out / 'titles'
+        galleries = patch.object(archive, "confirmed_galleries", return_value={})
+        self.galleries = galleries.start()
+        self.addCleanup(galleries.stop)
         self.calls = []
         self.options = {'title_001.mkv': (1, 10.0, [10.0])}
         self.media = {'verified': True, 'duration': 10.0, 'chapter_count': 0}
@@ -239,6 +242,23 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(json.loads(archive.receipt_path(path).read_text())['status'], 'incomplete')
         self.assertEqual(set(self.titles.iterdir()), {path, archive.receipt_path(path)})
+
+    def test_gallery_is_pending_and_title_extraction_continues(self):
+        gallery = 'title_001.mkv'
+        other_title = 'title_002.mkv'
+        self.options[other_title] = (2, 10.0, [10.0])
+        self.galleries.return_value = {1: {2, 3}}
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.extract()
+        self.assertIn('dvd-gallery-extract', output.getvalue())
+        self.assertFalse((self.titles / gallery).exists())
+        self.assertTrue((self.titles / other_title).exists())
+
+        status, manifest = self.verify()
+        pending = next(e for e in manifest['files'] if e['kind'] == 'gallery')
+        self.assertEqual(status, 1)
+        self.assertEqual(pending['status'], 'pending')
+        self.assertIn('galleries/title_001', pending['command'])
 
     def test_gallery_preserves_entry_and_cross_title_navigation(self):
         first = (2, 2, 1, 2, 255, 0, 3)
