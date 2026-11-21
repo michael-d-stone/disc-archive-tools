@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import math
 import re
 import shutil
 import subprocess
@@ -76,12 +77,42 @@ def ifo_tool():
 
 def inventory(source, kind):
     if kind == "title":
-        output = run(["lsdvd", str(source)])
-        titles = [int(n) for n in re.findall(r"^\s*Title:\s*(\d+)\b", output, re.M)]
-        if not titles or len(set(titles)) != len(titles) or min(titles) < 1:
-            raise ValueError("Could not determine a unique DVD title inventory")
-        return {f"title_{n:03d}.mkv": ["-title", str(n), "-trim", "0", "-preindex", "1"]
-                for n in titles}
+        output = run(["lsdvd", "-c", str(source)])
+        clock = r"(\d+):(\d{2}):(\d{2}\.\d+)"
+        title_line = re.compile(r"^Title:\s*(\d+), Length:\s*" + clock + r" Chapters:\s*(\d+),")
+        chapter_line = re.compile(r"^Chapter:\s*(\d+), Length:\s*" + clock)
+        result = {}
+        expected_counts = {}
+
+        def seconds(parts):
+            hours, minutes, seconds = map(float, parts)
+            return hours * 3600 + minutes * 60 + seconds
+
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("Title:"):
+                match = title_line.match(line)
+                if not match:
+                    raise ValueError(f"Invalid DVD title metadata: {line}")
+                number = int(match[1])
+                name = f"title_{number:03d}.mkv"
+                if number < 1 or name in result:
+                    raise ValueError(f"Invalid DVD title number: {number}")
+                chapter_count = int(match[5])
+                chapters = []
+                result[name] = (number, seconds(match.groups()[1:4]), chapters)
+                if chapter_count < 1:
+                    raise ValueError(f"Title {number} has no authored chapters")
+                # Check every title even if its chapter records are absent.
+                expected_counts[name] = chapter_count
+            elif line.startswith("Chapter:"):
+                match = chapter_line.match(line)
+                if not match or not result or int(match[1]) != len(chapters) + 1:
+                    raise ValueError(f"Invalid DVD chapter metadata: {line}")
+                chapters.append(seconds(match.groups()[1:4]))
+        if not result or any(len(item[2]) != expected_counts[name] for name, item in result.items()):
+            raise ValueError("Could not read complete authored DVD title metadata")
+        return result
     output = run([ifo_tool(), "--candidates", str(source)])
     result = {}
     for line in output.splitlines():
@@ -148,14 +179,16 @@ def receipt_path(path):
     return path.with_name(path.name + ".receipt.json")
 
 
-def receipt_valid(path, identity):
+def matching_receipt(path, identity):
     try:
         receipt = json.loads(receipt_path(path).read_text())
-        return (receipt.get("version") == 1 and receipt.get("source") == identity
+        if (receipt.get("version") in (1, 2) and receipt.get("source") == identity
                 and receipt.get("file") == path.name
-                and receipt.get("sha256") == digest(path))
+                and receipt.get("sha256") == digest(path)):
+            return receipt
     except (OSError, ValueError, AttributeError):
-        return False
+        pass
+    return None
 
 
 def probe(path):
@@ -180,45 +213,91 @@ def probe(path):
             "chapter_count": len(data.get("chapters", [])), "streams": streams}
 
 
+def duration_matches(expected, observed):
+    return (observed is not None and math.isfinite(observed)
+            and abs(expected - observed) <= 1 + expected * 0.0015)
+
+
+def completeness(title, observed):
+    _, duration, chapters = title
+    expected = {"duration": duration, "chapter_count": len(chapters)}
+    actual = {key: observed.get(key) for key in expected}
+    result = {"expected": expected, "observed": actual}
+    # FFmpeg omits chapter markers for a single-chapter title. Its whole
+    # runtime is the implicit chapter.
+    count_ok = actual["chapter_count"] == len(chapters) or (
+        len(chapters) == 1 and actual["chapter_count"] == 0
+    )
+    if not duration_matches(duration, actual["duration"]) or not count_ok:
+        result["error"] = (
+            f"Expected {duration:.3f}s and {len(chapters)} chapters; "
+            f"found {actual['duration']}s and {actual['chapter_count']} chapters"
+        )
+    return result
+
+
+def write_receipt(path, identity, checksum, check=None):
+    receipt = {"version": 1, "source": identity, "file": path.name, "sha256": checksum}
+    if check is not None:
+        receipt.update({"version": 2,
+                        "status": "incomplete" if "error" in check else "complete", **check})
+    atomic_json(receipt_path(path), receipt)
+
+
+def remux_dvd(source, options, destination):
+    input_args = ["-f", "dvdvideo", *options]
+    streams = probe_dvd_streams(source, input_args)
+    codecs = ["-c", "copy"]
+    for stream in streams:
+        if stream.get("codec_name") == "pcm_dvd":
+            codec = "pcm_s16le" if stream.get("sample_fmt") == "s16" else "pcm_s24le"
+            codecs.extend([f"-c:{stream['index']}", codec])
+    subprocess.run([FFMPEG, "-nostdin", "-xerror", "-abort_on", "empty_output", "-y",
+                    *input_args, "-i", str(source), "-map", "0", *codecs,
+                    "-f", "matroska", str(destination)], check=True)
+
+
 def extract(source, out, kind):
     identity = source_identity(source)
     expected = inventory(source, kind)
     out.mkdir(parents=True, exist_ok=True)
-    # Lock the directory inode rather than creating a replaceable lock file.
     fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        for name, options in expected.items():
+        for name, item in expected.items():
             path = out / name
-            if receipt_valid(path, identity):
-                print(f"Completed extraction matches source and checksum; skipping {path}")
-                continue
-            input_args = ["-f", "dvdvideo", *options]
-            # Stream metadata needs no chapter index. Leave indexing to extraction.
-            streams = probe_dvd_streams(source, input_args)
-            codecs = ["-c", "copy"]
-            for stream in streams:
-                if stream.get("codec_name") == "pcm_dvd":
-                    # DVD LPCM uses 16, 20, or 24 bits. Matroska accepts linear PCM.
-                    codec = "pcm_s16le" if stream.get("sample_fmt") == "s16" else "pcm_s24le"
-                    codecs.extend([f"-c:{stream['index']}", codec])
+            title = item if kind == "title" else None
+            receipt = matching_receipt(path, identity)
+            if receipt is not None:
+                check = None
+                try:
+                    if title:
+                        check = completeness(title, probe(path))
+                except ValueError as exc:
+                    check = {"error": str(exc)}
+                if check is not None:
+                    if "error" in check or receipt.get("status") != "incomplete":
+                        if receipt.get("version") == 1 or any(receipt.get(k) != v for k, v in check.items()):
+                            write_receipt(path, identity, receipt["sha256"], check)
+                if receipt.get("status") != "incomplete" and (check is None or "error" not in check):
+                    print(f"Completed extraction matches source and checksum; skipping {path}")
+                    continue
+            options = ["-title", str(title[0]), "-trim", "0", "-preindex", "1"] if title else item
             temp_fd, temp_name = tempfile.mkstemp(prefix=f".{name}.", suffix=".part", dir=out)
             os.close(temp_fd)
             temporary = Path(temp_name)
             try:
-                # Explicit format is necessary because the temporary suffix is .part.
-                command = [FFMPEG, "-nostdin", "-y", *input_args,
-                           "-i", str(source), "-map", "0", *codecs, "-f", "matroska", str(temporary)]
-                subprocess.run(command, check=True)
-                probe(temporary)
+                remux_dvd(source, options, temporary)
+                observed = probe(temporary)
+                check = completeness(title, observed) if title else None
+                if check and "error" in check:
+                    raise ValueError(f"{name}: {check['error']}")
                 checksum = digest(temporary)
                 with temporary.open("rb") as handle:
                     os.fsync(handle.fileno())
-                # Invalidate any previous completion record before publishing.
                 receipt_path(path).unlink(missing_ok=True)
                 os.replace(temporary, path)
-                atomic_json(receipt_path(path), {"version": 1, "source": identity,
-                                                "file": name, "sha256": checksum})
+                write_receipt(path, identity, checksum, check)
             finally:
                 temporary.unlink(missing_ok=True)
     finally:
@@ -231,23 +310,40 @@ def verify(source, root):
     identity = source_identity(source)
     expected = {}
     for kind, directory in (("title", "titles"), ("menu", "menus")):
-        expected.update({f"{directory}/{name}": kind for name in inventory(source, kind)})
+        expected.update({f"{directory}/{name}": (kind, item)
+                         for name, item in inventory(source, kind).items()})
     actual = {str(p.relative_to(root)) for directory in ("titles", "menus")
               for p in (root / directory).glob("*.mkv")}
     entries = []
     for name in sorted(set(expected) | actual):
         path = root / name
-        entry = {"file": name, "kind": expected.get(name, "unknown"), "verified": False}
+        entry = {"file": name, "kind": expected.get(name, ("unknown", None))[0], "verified": False}
         try:
             if name not in expected:
                 raise ValueError("Unexpected file: absent from source inventory")
             if not path.is_file():
                 raise ValueError("Expected file is missing")
-            if not receipt_valid(path, identity):
-                raise ValueError("Missing or invalid completion receipt, source mismatch, or checksum mismatch; re-extract")
-            entry.update(probe(path))
-            entry["sha256"] = digest(path)
+            fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                receipt = matching_receipt(path, identity)
+                if receipt is None:
+                    raise ValueError("Missing or invalid completion receipt, source mismatch, or checksum mismatch; re-extract")
+                entry.update(probe(path))
+                entry["sha256"] = receipt["sha256"]
+                kind, item = expected[name]
+                if kind == "title":
+                    check = completeness(item, entry)
+                    entry.update(check)
+                    if "error" in check:
+                        write_receipt(path, identity, entry["sha256"], check)
+                        raise ValueError(check["error"])
+                if receipt.get("status") == "incomplete":
+                    raise ValueError(receipt.get("error", "Incomplete receipt; re-extract"))
+            finally:
+                os.close(fd)
         except (OSError, ValueError) as exc:
+            entry["verified"] = False
             entry["error"] = str(exc)
         entries.append(entry)
         print(f"{name}: {'verified' if entry['verified'] else entry['error']}", file=sys.stderr)

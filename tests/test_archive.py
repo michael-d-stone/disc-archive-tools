@@ -29,7 +29,8 @@ class ArchiveTests(unittest.TestCase):
         self.out = self.root / 'output'
         self.titles = self.out / 'titles'
         self.calls = []
-        self.options = {'title_001.mkv': ['-title', '1']}
+        self.options = {'title_001.mkv': (1, 10.0, [10.0])}
+        self.media = {'verified': True, 'duration': 10.0, 'chapter_count': 0}
 
     def fake_ffmpeg(self, command, **kwargs):
         self.calls.append(command)
@@ -40,7 +41,7 @@ class ArchiveTests(unittest.TestCase):
         with patch.object(archive, 'inventory', return_value=self.options), \
              patch.object(archive, 'probe_dvd_streams', return_value=[]), \
              patch.object(archive.subprocess, 'run', side_effect=ffmpeg or self.fake_ffmpeg), \
-             patch.object(archive, 'probe', return_value={'verified': True}):
+             patch.object(archive, 'probe', return_value=self.media):
             archive.extract(self.source, self.titles, 'title')
 
     def test_only_dvd_pcm_streams_use_lossless_pcm_conversion(self):
@@ -53,7 +54,7 @@ class ArchiveTests(unittest.TestCase):
         with patch.object(archive, 'inventory', return_value=self.options), \
              patch.object(archive, 'probe_dvd_streams', return_value=streams), \
              patch.object(archive.subprocess, 'run', side_effect=self.fake_ffmpeg), \
-             patch.object(archive, 'probe'):
+             patch.object(archive, 'probe', return_value=self.media):
             archive.extract(self.source, self.titles, 'title')
         self.assertEqual(self.calls[0][-9:-3], [
             "-c", "copy", "-c:1", "pcm_s16le", "-c:3", "pcm_s24le",
@@ -76,7 +77,7 @@ class ArchiveTests(unittest.TestCase):
     def verify(self):
         output = io.StringIO()
         with patch.object(archive, 'inventory', side_effect=self.inventories), \
-             patch.object(archive, 'probe', return_value={'verified': True}), \
+             patch.object(archive, 'probe', return_value=self.media), \
              contextlib.redirect_stdout(output):
             status = archive.verify(self.source, self.out)
         path = Path(output.getvalue().strip().removeprefix('Verification result: '))
@@ -168,7 +169,7 @@ class ArchiveTests(unittest.TestCase):
         # Titles-only disc is valid when menu discovery succeeds with no candidates.
         with patch.object(archive, 'inventory', side_effect=lambda source, kind:
                           self.options if kind == 'title' else {}), \
-             patch.object(archive, 'probe', return_value={'verified': True}):
+             patch.object(archive, 'probe', return_value=self.media):
             self.assertEqual(archive.verify(self.source, self.out), 0)
         self.assertEqual(json.loads((self.out / 'manifest.json').read_text())['summary']['failed'], 0)
 
@@ -188,9 +189,34 @@ class ArchiveTests(unittest.TestCase):
         self.assertTrue((self.out / 'verified-2026-01-02-030405-UTC-1.json').is_file())
 
     def test_actual_title_numbers_are_preserved(self):
-        with patch.object(archive, 'run', return_value='Title: 01, Length: x\nTitle: 03, Length: y\n'):
+        output = "".join(f"Title: {n:02d}, Length: 00:00:10.000 Chapters: 1,\n"
+                         "  Chapter: 01, Length: 00:00:10.000\n" for n in (1, 3))
+        with patch.object(archive, 'run', return_value=output):
             self.assertEqual(set(archive.inventory(self.source, 'title')),
                              {'title_001.mkv', 'title_003.mkv'})
+
+    def test_short_legacy_title_fails_verification_and_is_retried(self):
+        self.extract()
+        path = self.titles / 'title_001.mkv'
+        identity = archive.source_identity(self.source)
+        archive.write_receipt(path, identity, archive.digest(path))
+        self.options[path.name] = (1, 60.0, [10.0, 50.0])
+        status, manifest = self.verify()
+        entry = next(e for e in manifest['files'] if e['kind'] == 'title')
+        self.assertEqual(status, 1)
+        self.assertFalse(entry['verified'])
+        self.assertEqual(entry['expected'], {'duration': 60.0, 'chapter_count': 2})
+        self.assertEqual(json.loads(archive.receipt_path(path).read_text())['status'], 'incomplete')
+
+        with self.assertRaisesRegex(ValueError, 'Expected 60.000s'):
+            self.extract()
+        self.assertEqual(len(self.calls), 2)
+
+    def test_complete_runtime_with_missing_chapter_marker_is_incomplete(self):
+        check = archive.completeness((1, 60.0, [10.0, 50.0]), {
+            'duration': 60.0, 'chapter_count': 1,
+        })
+        self.assertIn('error', check)
 
     def test_directory_fingerprint_tracks_dvd_content_only(self):
         dvd = self.root / 'folder'
@@ -213,7 +239,7 @@ class ArchiveTests(unittest.TestCase):
         self.extract()
         path = self.titles / 'title_001.mkv'
         archive.receipt_path(path).write_text('[]')
-        self.assertFalse(archive.receipt_valid(path, archive.source_identity(self.source)))
+        self.assertIsNone(archive.matching_receipt(path, archive.source_identity(self.source)))
 
 
 class IfoFailureTests(unittest.TestCase):
