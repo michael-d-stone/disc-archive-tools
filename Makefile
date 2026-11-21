@@ -14,26 +14,32 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
 PROGRAM = build-ifo-dump
-SCRIPTS = scripts/dvd-archive scripts/dvd-title-extract scripts/dvd-menu-extract scripts/dvd-extract scripts/dvd-verify
+GALLERY_PROGRAM = build-gallery-nav
+SCRIPTS = scripts/dvd-archive scripts/dvd-title-extract scripts/dvd-menu-extract scripts/dvd-extract scripts/dvd-verify scripts/dvd-gallery-extract
 
 .PHONY: all disc-archive-tools clean install install-disc-archive-tools uninstall test test-fixtures ffmpeg install-ffmpeg
 
 all: disc-archive-tools
 
-disc-archive-tools: $(PROGRAM)
+disc-archive-tools: $(PROGRAM) $(GALLERY_PROGRAM)
 
 $(PROGRAM): src/ifo_dump.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDFLAGS) -ldvdread
 
+$(GALLERY_PROGRAM): src/gallery_nav.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@.tmp $< $(LDFLAGS) -ldvdnav -ldvdread
+	mv $@.tmp $@
+
 clean:
-	rm -f $(PROGRAM)
+	rm -f $(PROGRAM) $(GALLERY_PROGRAM)
 
 install: install-disc-archive-tools
 
 install-disc-archive-tools:
-	test -x "$(PROGRAM)" || { echo "error: run 'make disc-archive-tools' first"; exit 1; }
+	test -x "$(PROGRAM)" && test -x "$(GALLERY_PROGRAM)" || { echo "error: run 'make disc-archive-tools' first"; exit 1; }
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m 755 $(PROGRAM) "$(DESTDIR)$(BINDIR)/dvd-ifo-dump"
+	install -m 755 $(GALLERY_PROGRAM) "$(DESTDIR)$(BINDIR)/dvd-gallery-nav"
 	install -m 755 $(SCRIPTS) "$(DESTDIR)$(BINDIR)/"
 
 uninstall:
@@ -43,7 +49,9 @@ uninstall:
 		"$(DESTDIR)$(BINDIR)/dvd-title-extract" \
 		"$(DESTDIR)$(BINDIR)/dvd-menu-extract" \
 		"$(DESTDIR)$(BINDIR)/dvd-extract" \
-		"$(DESTDIR)$(BINDIR)/dvd-verify"
+		"$(DESTDIR)$(BINDIR)/dvd-verify" \
+		"$(DESTDIR)$(BINDIR)/dvd-gallery-nav" \
+		"$(DESTDIR)$(BINDIR)/dvd-gallery-extract"
 
 test:
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'

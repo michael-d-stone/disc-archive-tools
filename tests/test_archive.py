@@ -240,6 +240,47 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(json.loads(archive.receipt_path(path).read_text())['status'], 'incomplete')
         self.assertEqual(set(self.titles.iterdir()), {path, archive.receipt_path(path)})
 
+    def test_gallery_preserves_entry_and_cross_title_navigation(self):
+        first = (2, 2, 1, 2, 255, 0, 3)
+        second = (1, 2, 1, 2, 255, 0, 3)
+        third = (1, 3, 1, 3, 255, 0, 3)
+
+        def trace(source, title, chapter, action):
+            if chapter == 1:
+                return first, first
+            index = [first, second, third].index(next(
+                still for still in [first, second, third] if still[:2] == (title, chapter)))
+            state = [first, second, third][index]
+            target = {"next": [second, third, first][index], "root-menu": "root-menu"}.get(action)
+            return state, target
+
+        with patch.object(archive, 'gallery_point', side_effect=trace):
+            graph = archive.gallery_graph(self.source, 1, {1: {2, 3}, 2: {2}}, {})
+        entry = graph['images'][graph['entry']]
+        self.assertEqual(entry['title'], 2)
+        self.assertEqual(entry['hold'], 'indefinite')
+        self.assertEqual(entry['actions']['next'], {'image': archive.gallery_id(second)})
+        self.assertEqual(entry['actions']['root-menu'], {'exit': 'root-menu'})
+
+        identity = archive.source_identity(self.source)
+        path = archive.gallery_destination(self.out, 1)
+        def png_output(command):
+            Path(command[-1]).write_bytes(archive.PNG_HEADER + b'fake payload')
+        with patch.object(archive, 'run', side_effect=png_output):
+            archive.publish_gallery(self.source, 1, path, identity, graph)
+        self.assertEqual(archive.verify_gallery(path, identity, 1, graph), 3)
+        manifest_file = path / 'manifest.json'
+        manifest = json.loads(manifest_file.read_text())
+        manifest['navigation']['images'][graph['entry']]['actions']['next'] = {'image': 'absent'}
+        manifest_file.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'navigation'):
+            archive.verify_gallery(path, identity, 1, graph)
+        manifest['navigation'] = graph
+        manifest_file.write_text(json.dumps(manifest))
+        (path / entry['image']).unlink()
+        with self.assertRaises(FileNotFoundError):
+            archive.verify_gallery(path, identity, 1, graph)
+
     def test_directory_fingerprint_tracks_dvd_content_only(self):
         dvd = self.root / 'folder'
         video = dvd / 'VIDEO_TS'

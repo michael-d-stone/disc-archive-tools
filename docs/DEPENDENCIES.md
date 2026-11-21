@@ -131,8 +131,8 @@ The important dependency relationships are:
 - lsdvd is invoked as a separate executable.
 - Bash and Python are script interpreters.
 - awk and standard Unix utilities are invoked as separate commands.
-- libdvdnav is used by the required DVD-enabled FFmpeg build rather than
-  directly by disc-archive-tools.
+- `dvd-gallery-nav` links against libdvdread and libdvdnav to discover and trace
+  interactive still galleries. The DVD-enabled FFmpeg build also uses both libraries.
 
 ## Provenance and licensing
 

@@ -312,6 +312,245 @@ def recover_chapters(source, title, destination):
         print(f"Title {number}: chapter join preserved packet counts {expected_packets}")
 
 
+def gallery_tool():
+    local = Path(__file__).resolve().parent.parent / "build-gallery-nav"
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    installed = shutil.which("dvd-gallery-nav")
+    if not installed:
+        raise ValueError("dvd-gallery-nav not found; build or install disc-archive-tools")
+    return installed
+
+
+def gallery_inventory(source):
+    result = {}
+    for line in run([gallery_tool(), "inventory", str(source)]).splitlines():
+        if line.startswith("gallery "):
+            number, *chapters = map(int, line.split()[1:])
+            result[number] = set(chapters)
+    return result
+
+
+GALLERY_ACTIONS = {
+    "previous": "Previous chapter", "next": "Next chapter", "return": "Return",
+    "root-menu": "Root menu", "title-menu": "Title menu",
+}
+GALLERY_EXITS = {"root-menu": "DVD root menu", "title-menu": "DVD title menu",
+                 "stop": "End of DVD playback"}
+PNG_HEADER = b"\x89PNG\x0d\x0a\x1a\x0a"
+
+
+def gallery_point(source, title, chapter, action):
+    output = run([gallery_tool(), "trace", str(source), str(title), str(chapter), action])
+    rows = [line.split()[1:] for line in output.splitlines() if line.startswith("point ")]
+    if len(rows) != (1 if action == "entry" else 2):
+        raise ValueError(f"Unexpected navigation trace for title {title} chapter {chapter} ({action})")
+
+    def parse(row):
+        if row[0] == "still":
+            return tuple(map(int, row[1:]))
+        if row[0] == "exit" and row[1] in GALLERY_EXITS:
+            return row[1]
+        if row == ["unavailable"]:
+            return None
+        raise ValueError(f"Unknown DVD gallery event: {row}")
+
+    return parse(rows[0]), parse(rows[-1])
+
+
+def confirmed_galleries(source):
+    result = {}
+    for title, chapters in gallery_inventory(source).items():
+        first = min(chapters)
+        still, _ = gallery_point(source, title, first, "entry")
+        if not isinstance(still, tuple) or still[:2] != (title, first) or still[4] != 255:
+            raise ValueError(f"Title {title} chapter {first}: IFO still disagrees with DVD playback")
+        result[title] = chapters
+    return result
+
+
+def gallery_id(still):
+    title, chapter, pgc, cell, *_ = still
+    return f"t{title:03d}-p{chapter:03d}-pgc{pgc:03d}-c{cell:03d}"
+
+
+def gallery_graph(source, title, galleries, cache):
+    if title not in galleries:
+        raise ValueError(f"Title {title} is not a confirmed DVD still gallery")
+    entry, _ = gallery_point(source, title, 1, "entry")
+    pending = [entry]
+    nodes = {}
+    while pending:
+        still = pending.pop()
+        number, chapter, pgc, cell, hold, buttons, aspect = still
+        key = gallery_id(still)
+        if key in nodes:
+            continue
+        if (chapter not in galleries.get(number, ()) or hold != 255 or buttons or aspect not in (0, 3)):
+            raise ValueError(f"Unsupported still or buttons at title {number}, chapter {chapter}, cell {cell}")
+        if still not in cache:
+            transitions = {}
+            for action in GALLERY_ACTIONS:
+                start, target = gallery_point(source, number, chapter, action)
+                if start != still:
+                    raise ValueError(f"Cannot replay title {number}, chapter {chapter}, cell {cell} ({action})")
+                if target is not None:
+                    transitions[action] = target
+            cache[still] = transitions
+        actions = {}
+        for action, target in cache[still].items():
+            if isinstance(target, tuple):
+                actions[action] = {"image": gallery_id(target)}
+                pending.append(target)
+            else:
+                actions[action] = {"exit": target}
+        nodes[key] = {"title": number, "chapter": chapter, "pgc": pgc, "cell": cell,
+                      "hold": "indefinite", "aspect": "16/9" if aspect == 3 else "4/3",
+                      "image": f"{key}.png", "actions": actions}
+    visited = {node["chapter"] for node in nodes.values() if node["title"] == title}
+    missing = galleries[title] - visited
+    if missing:
+        raise ValueError(f"Title {title}: could not reach still chapters {sorted(missing)}")
+    return {"entry": gallery_id(entry), "images": nodes}
+
+
+def gallery_page(graph):
+    data = json.dumps(graph, separators=(",", ":")).replace("<", "\\u003c")
+    return """<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DVD still gallery</title>
+<style>
+body { margin: auto; padding: 1rem; max-width: 64rem; background: #161616; color: #eee;
+       font: 1rem system-ui, sans-serif; }
+[hidden] { display: none !important; }
+img { display: block; width: 100%; max-height: 78vh; object-fit: fill; background: black; }
+nav { display: flex; flex-wrap: wrap; gap: .5rem; }
+button { font: inherit; padding: .45rem .8rem; }
+</style>
+<h1>DVD still gallery</h1>
+<img id="still" alt="DVD gallery still" hidden>
+<p id="position" role="status"></p>
+<nav id="controls" aria-label="DVD controls"></nav>
+<script>
+const graph = """ + data + """;
+const labels = """ + json.dumps(GALLERY_ACTIONS) + """;
+const exits = """ + json.dumps(GALLERY_EXITS) + """;
+const picture = document.querySelector("#still");
+const position = document.querySelector("#position");
+const controls = document.querySelector("#controls");
+let current;
+function button(label, callback) {
+    const control = document.createElement("button");
+    control.textContent = label;
+    control.onclick = callback;
+    controls.append(control);
+}
+function show(id) {
+    current = graph.images[id];
+    picture.hidden = false;
+    picture.style.aspectRatio = current.aspect;
+    picture.style.width = `min(100%, calc(78vh * ${current.aspect}))`;
+    picture.src = current.image;
+    position.textContent = `Title ${current.title} · Chapter ${current.chapter}`;
+    controls.replaceChildren();
+    for (const action of Object.keys(labels)) {
+        if (current.actions[action]) button(labels[action], () => act(action));
+    }
+}
+function act(action) {
+    const target = current?.actions[action];
+    if (!target) return;
+    if (target.image) {
+        show(target.image);
+        Array.from(controls.children).find(control => control.textContent === labels[action])?.focus();
+    } else {
+        current = null;
+        picture.hidden = true;
+        position.textContent = `DVD destination: ${exits[target.exit]}`;
+        controls.replaceChildren();
+        button("Restart gallery", () => show(graph.entry));
+        controls.firstElementChild.focus();
+    }
+}
+document.addEventListener("keydown", event => {
+    const action = {"ArrowLeft": "previous", "ArrowRight": "next"}[event.key];
+    if (action && current?.actions[action]) {
+        event.preventDefault();
+        act(action);
+    }
+});
+show(graph.entry);
+</script>
+"""
+
+
+def gallery_image_hash(path):
+    with path.open("rb") as handle:
+        if handle.read(len(PNG_HEADER)) != PNG_HEADER:
+            raise ValueError(f"Invalid gallery image: {path.name}")
+    return digest(path)
+
+
+def verify_gallery(path, identity, title, graph):
+    record = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    if (not isinstance(record, dict) or record.get("version") != 1
+            or record.get("source") != identity or record.get("title") != title):
+        raise ValueError("Gallery manifest does not match the source title")
+    if record.get("navigation") != graph:
+        raise ValueError("Gallery stills or navigation do not match the DVD")
+    checksums = record.get("images")
+    if not isinstance(checksums, dict) or set(checksums) != {
+            node["image"] for node in graph["images"].values()}:
+        raise ValueError("Gallery image inventory does not match the DVD")
+    for filename, checksum in checksums.items():
+        if gallery_image_hash(path / filename) != checksum:
+            raise ValueError(f"Gallery image checksum mismatch: {filename}")
+    if (path / "index.html").read_text(encoding="utf-8") != gallery_page(graph):
+        raise ValueError("Gallery page does not match its verified navigation")
+    return len(checksums)
+
+
+def gallery_destination(root, title):
+    return root / "galleries" / f"title_{title:03d}"
+
+
+def extract_gallery(source, title, destination):
+    identity = source_identity(source)
+    graph = gallery_graph(source, title, confirmed_galleries(source), {})
+    publish_gallery(source, title, destination, identity, graph)
+
+
+def publish_gallery(source, title, destination, identity, graph):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        verify_gallery(destination, identity, title, graph)
+        print(f"Gallery verified: {destination / 'index.html'}")
+        return
+    with tempfile.TemporaryDirectory(prefix=".gallery-", dir=destination.parent) as directory:
+        work = Path(directory) / "gallery"
+        work.mkdir()
+        checksums = {}
+        for node in graph["images"].values():
+            number, chapter = str(node["title"]), str(node["chapter"])
+            image = work / node["image"]
+            try:
+                run([FFMPEG, "-nostdin", "-v", "error", "-xerror", "-f", "dvdvideo",
+                     "-title", number, "-chapter_start", chapter, "-chapter_end", chapter,
+                     "-trim", "0", "-preindex", "0", "-i", str(source),
+                     "-map", "0:v:0", "-c:v", "png", "-f", "image2", "-update", "1", str(image)])
+                checksums[image.name] = gallery_image_hash(image)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"Could not extract title {number} chapter {chapter}: {exc}") from exc
+        (work / "index.html").write_text(gallery_page(graph), encoding="utf-8")
+        atomic_json(work / "manifest.json", {"version": 1, "source": identity, "title": title,
+                                             "navigation": graph, "images": checksums})
+        verify_gallery(work, identity, title, graph)
+        os.rename(work, destination)
+    print(f"Gallery exported: {destination / 'index.html'}")
+
+
 def extract(source, out, kind):
     identity = source_identity(source)
     expected = inventory(source, kind)
@@ -419,9 +658,19 @@ def main(mode=None):
     args = sys.argv[1:]
     if mode is None:
         if not args:
-            print("Usage: dvd-archive <title|menu|verify> <source> [output]", file=sys.stderr)
+            print("Usage: dvd-archive <title|menu|verify|gallery> <source> [output]", file=sys.stderr)
             return 1
         mode, *args = args
+    if mode == "gallery":
+        if len(args) != 3:
+            print("Usage: dvd-gallery-extract SOURCE TITLE OUTPUT", file=sys.stderr)
+            return 1
+        try:
+            extract_gallery(Path(args[0]).resolve(), int(args[1]), Path(args[2]).resolve())
+            return 0
+        except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
     if mode not in {"title", "menu", "verify"} or len(args) not in ({2} if mode == "verify" else {1, 2}):
         print("Usage: <command> <dvd.iso|dvd-directory> [output-directory]", file=sys.stderr)
         return 1

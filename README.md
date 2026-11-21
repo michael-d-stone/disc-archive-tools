@@ -111,6 +111,7 @@ extraction, and verification in sequence, stopping if any step fails.
 | `dvd-extract SOURCE [OUTPUT]` | Run the complete workflow; default output is `dvd-extract/`. |
 | `dvd-title-extract SOURCE [OUTPUT]` | Extract authored titles only; default output is `titles/`. |
 | `dvd-menu-extract SOURCE [OUTPUT]` | Extract playable menu content only; default output is `menus/`. |
+| `dvd-gallery-extract SOURCE TITLE OUTPUT` | Export an interactive still gallery as an offline HTML page and lossless PNG images. |
 | `dvd-verify SOURCE OUTPUT` | Recheck an extraction and write `manifest.json`; requires the original source. |
 | `dvd-ifo-dump [--candidates] SOURCE` | Inspect DVD menu metadata; `--candidates` lists playable menu locations. |
 

@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Michael Stone
+# SPDX-License-Identifier: GPL-2.0-or-later
+import runpy
+import sys
+from pathlib import Path
+
+implementation = runpy.run_path(str(Path(__file__).resolve().with_name("dvd-archive")))
+sys.exit(implementation["main"]("gallery"))
