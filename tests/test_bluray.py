@@ -43,10 +43,11 @@ class BluRayTests(unittest.TestCase):
         return subprocess.CompletedProcess(command, 0)
 
     def verify(self, playlists):
-        with contextlib.redirect_stdout(io.StringIO()):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
             status = verify(self.source, self.out, self.identity, playlists, {})
-        files = sorted(self.out.glob("*.json"), key=lambda p: p.stat().st_mtime_ns)
-        return status, json.loads(files[-1].read_text())
+        path = Path(output.getvalue().strip().removeprefix("Verification result: "))
+        return status, json.loads(path.read_text())
 
     def test_complete_resume_missing_unexpected_and_modified(self):
         with patch.dict(globals_, {"probe": lambda path: self.media, "check_packet_timestamps": lambda path: None}), \
