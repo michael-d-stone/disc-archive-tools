@@ -75,7 +75,7 @@ Use of libdvdread is documented separately in `docs/DEPENDENCIES.md`.
 ## External software
 
 disc-archive-tools relies on external free and open-source software including
-libdvdread, libdvdnav, FFmpeg, lsdvd, Bash, Python, GNU awk, GNU Make, GCC,
+libbluray, libdvdread, libdvdnav, FFmpeg, lsdvd, Bash, Python, GNU awk, GNU Make, GCC,
 and standard Unix utilities.
 
 Their roles, tested versions, and known licensing information are recorded in

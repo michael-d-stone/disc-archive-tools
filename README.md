@@ -31,6 +31,7 @@ Install the required packages:
 sudo apt update
 sudo apt install \
   build-essential \
+  libbluray-dev \
   libdvdread-dev \
   libdvdnav-dev \
   lsdvd \
@@ -40,7 +41,8 @@ sudo apt install \
   xz-utils
 ```
 
-Build and install the included FFmpeg 9.0.1 source with DVD-Video support:
+Build and install the included FFmpeg 9.0.1 source with DVD-Video and
+Blu-ray protocol support:
 
 ```bash
 make ffmpeg
@@ -55,6 +57,12 @@ sudo make install-disc-archive-tools
 ```
 
 The FFmpeg build is installed under `/opt/ffmpeg-dvd`. The disc-archive-tools commands are installed under `/usr/local/bin`.
+Confirm the installed FFmpeg has both disc capabilities:
+
+```bash
+/opt/ffmpeg-dvd/bin/ffmpeg -hide_banner -protocols | grep bluray
+/opt/ffmpeg-dvd/bin/ffmpeg -hide_banner -demuxers | grep dvdvideo
+```
 
 ## Inspect a disc
 

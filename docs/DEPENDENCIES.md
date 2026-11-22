@@ -49,6 +49,7 @@ The tested FFmpeg build was configured as:
     --enable-gpl
     --enable-libdvdread
     --enable-libdvdnav
+    --enable-libbluray
 
 The project requires FFmpeg with the `dvdvideo` demuxer and the DVD support
 needed by the extraction scripts.
@@ -75,6 +76,12 @@ Run `bd_list_titles -a -l SOURCE` with a Blu-ray ISO or the directory
 containing `BDMV`. This
 inspection step uses the packaged tool independently of the project's FFmpeg
 build. Blu-ray extraction is planned.
+
+### libbluray
+
+- Debian packages: libbluray2, libbluray-dev
+- Use: Blu-ray protocol support in the project's FFmpeg build
+- FFmpeg links to the system libbluray library
 
 ## Runtime dependencies
 
@@ -131,7 +138,7 @@ disc-archive-tools vendors the unmodified FFmpeg 9.0.1 source archive and
 its verification materials under `vendor/`. Compiled FFmpeg binaries are not
 vendored.
 
-The project does not vendor libdvdread, libdvdnav, lsdvd, Bash, Python,
+The project does not vendor libbluray, libdvdread, libdvdnav, lsdvd, Bash, Python,
 GNU awk, GNU Make, GCC, or GNU coreutils.
 
 The important dependency relationships are:

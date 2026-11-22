@@ -73,7 +73,8 @@ ffmpeg:
 		--prefix="$(FFMPEG_PREFIX)" \
 		--enable-gpl \
 		--enable-libdvdread \
-		--enable-libdvdnav
+		--enable-libdvdnav \
+		--enable-libbluray
 	$(MAKE) -C "$(FFMPEG_BUILD)" -j"$$(nproc)"
 
 install-ffmpeg:
