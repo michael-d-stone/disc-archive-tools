@@ -46,18 +46,20 @@ Initial staging runs on Its A Mommy Thing 5 and Breakin Em In 9 found
 playlist-boundary problems. Several audio streams contain distinct packets
 with identical DTS values at a clip transition. On Its A Mommy Thing 5
 playlist 00001, the corresponding source packets have different timestamps.
-Using FFmpeg's `-copyts` retains those audio timestamps in a test, but leaves
-the output with an incorrect duration. FFmpeg also failed to read some VC-1
-dimensions or audio parameters, and reported corrupt packets on another
-playlist. A larger probe lets some files proceed, but it does not resolve
-all failures. These outputs need further investigation before the workflow
-can be considered complete for these discs.
+The extractor now retries a supported two-clip timestamp-wrap layout using the
+authored clip timing, then compares every video and audio packet's payload and
+mapped timestamps with the source. Playlist 00001 passed this check in staging.
 
-Next, establish a lossless way to handle clip boundaries and dynamic stream
-changes, then re-extract and check video and audio continuity. Test alternate
-angles, branching, additional codecs, and a representative ISO before
-claiming support. Blu-ray menu extraction and interactive navigation remain
-separate follow-up work.
+FFmpeg also failed to read some VC-1 dimensions or audio parameters, and
+reported corrupt packets on another playlist. A larger probe lets some files
+proceed, but it does not resolve all failures. These outputs need further
+investigation before the workflow can be considered complete for these discs.
+
+Next, extend lossless boundary handling to other playlist layouts and dynamic
+stream changes, then re-extract and check video and audio continuity. Test
+alternate angles, branching, additional codecs, and a representative ISO
+before claiming support. Blu-ray menu extraction and interactive navigation
+remain separate follow-up work.
 
 ## Format backlog
 
