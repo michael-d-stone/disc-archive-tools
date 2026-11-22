@@ -29,3 +29,4 @@ test_dvd_extract/
 build-ifo-dump
 test_seinfeld_extract/
 build-gallery-nav
+build-bluray-info

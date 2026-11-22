@@ -30,8 +30,7 @@ and enumerate playable menu PGC candidates.
 - Debian packages: libdvdnav4, libdvdnav-dev
 - License: GPL-2.0-or-later, with separately licensed files in the upstream
   source distribution
-- Use: dependency of the project's DVD-enabled FFmpeg build
-- Not linked directly into disc-archive-tools code
+- Use: DVD navigation for FFmpeg and the project’s `dvd-gallery-nav` helper
 
 ### FFmpeg
 
@@ -79,9 +78,18 @@ build. Blu-ray extraction is planned.
 
 ### libbluray
 
+- Tested version: 1.3.4
 - Debian packages: libbluray2, libbluray-dev
+- License: LGPL-2.1-or-later, with separately licensed upstream files
 - Use: Blu-ray protocol support in the project's FFmpeg build
-- FFmpeg links to the system libbluray library
+- FFmpeg and the project’s `bluray-info` helper link to the system libbluray library
+
+### libudfread
+
+- Tested version: 1.1.2
+- Debian packages: libudfread0, libudfread-dev
+- License: LGPL-2.1-or-later, with separately licensed upstream files
+- Use: `bluray-info` checks playlist inventory in ISO images
 
 ## Runtime dependencies
 
@@ -138,7 +146,7 @@ disc-archive-tools vendors the unmodified FFmpeg 9.0.1 source archive and
 its verification materials under `vendor/`. Compiled FFmpeg binaries are not
 vendored.
 
-The project does not vendor libbluray, libdvdread, libdvdnav, lsdvd, Bash, Python,
+The project does not vendor libbluray, libudfread, libdvdread, libdvdnav, lsdvd, Bash, Python,
 GNU awk, GNU Make, GCC, or GNU coreutils.
 
 The important dependency relationships are:

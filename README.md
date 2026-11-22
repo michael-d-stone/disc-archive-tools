@@ -34,6 +34,7 @@ sudo apt install \
   libbluray-dev \
   libdvdread-dev \
   libdvdnav-dev \
+  libudfread-dev \
   lsdvd \
   nasm \
   pkg-config \
