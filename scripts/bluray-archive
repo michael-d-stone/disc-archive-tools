@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Michael Stone
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Extract and verify authored Blu-ray playlists."""
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+import tempfile
+
+dvd = runpy.run_path(str(Path(__file__).resolve().with_name("dvd-archive")))
+FFMPEG = dvd["FFMPEG"]
+FFPROBE = dvd["FFPROBE"]
+digest = dvd["digest"]
+atomic_json = dvd["atomic_json"]
+publish_manifest = dvd["publish_manifest"]
+
+CODECS = {
+    0x01: "mpeg1video", 0x02: "mpeg2video", 0x1b: "h264", 0x24: "hevc", 0xea: "vc1",
+    0x03: "mp3", 0x04: "mp3", 0x80: "pcm_bluray", 0x81: "ac3", 0x82: "dts",
+    0x83: "truehd", 0x84: "eac3", 0x85: "dts", 0x86: "dts", 0x90: "hdmv_pgs_subtitle",
+}
+
+
+def source_details(source):
+    source = source.resolve(strict=True)
+    if source.is_file():
+        return source, {"type": "file", "sha256": digest(source)}
+    if source.name.upper() == "BDMV":
+        bdmv = source
+        source = source.parent
+    else:
+        matches = [p for p in source.iterdir() if p.is_dir() and p.name.upper() == "BDMV"]
+        if len(matches) != 1:
+            raise ValueError("Blu-ray directory must contain exactly one BDMV directory")
+        bdmv = matches[0]
+    files = []
+    for path in sorted(bdmv.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"Symbolic link in BDMV source: {path}")
+        if path.is_file():
+            files.append({"file": str(path.relative_to(source)), "sha256": digest(path)})
+    if not files:
+        raise ValueError("BDMV directory is empty")
+    return source, {"type": "directory", "files": files}
+
+
+def info_tool():
+    local = Path(__file__).resolve().parent.parent / "build-bluray-info"
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    installed = shutil.which("bluray-info")
+    if not installed:
+        raise ValueError("bluray-info not found; run make or install disc-archive-tools")
+    return installed
+
+
+def inventory(source):
+    # libbluray can print messages directly to stdout, so write its JSON to a file.
+    with tempfile.TemporaryFile(mode="w+") as output:
+        result = subprocess.run([info_tool(), str(source)], stdout=output,
+                                stderr=subprocess.PIPE, text=True)
+        output.seek(0)
+        text = output.read()
+    if result.returncode:
+        raise ValueError(f"Blu-ray inventory failed: {result.stderr.strip()}")
+    try:
+        data = json.loads(text[text.index('{"menus":'):])
+        playlists = data["playlists"]
+        result = {p["id"]: p for p in playlists}
+        if len(result) != len(playlists) or not result:
+            raise ValueError("Duplicate or empty playlist inventory")
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f"Invalid Blu-ray inventory: {exc}") from exc
+    if source.is_dir():
+        bdmv = next(p for p in source.iterdir() if p.is_dir() and p.name.upper() == "BDMV")
+        directories = [p for p in bdmv.iterdir() if p.is_dir() and p.name.upper() == "PLAYLIST"]
+        if len(directories) != 1:
+            raise ValueError("Cannot find the source PLAYLIST directory")
+        files = {int(p.stem) for p in directories[0].iterdir()
+                 if p.is_file() and re.fullmatch(r"\d{5}\.mpls", p.name, re.I)}
+        if files != set(result):
+            raise ValueError(f"libbluray inventory differs from MPLS files: missing {sorted(files - set(result))}, unexpected {sorted(set(result) - files)}")
+    return result, data["menus"]
+
+
+def expected_streams(playlist):
+    streams = {}
+    for clip in playlist["clips"]:
+        if clip["still_mode"]:
+            raise ValueError("Playlist contains an interactive or timed still")
+        if clip["secondary_audio"] or clip["secondary_video"]:
+            raise ValueError("Playlist contains secondary audio or video")
+        for stream in clip["streams"]:
+            if stream["coding"] not in CODECS:
+                raise ValueError(f"Unsupported Blu-ray stream coding 0x{stream['coding']:02x}")
+            key = (stream["type"], stream["pid"])
+            codec = CODECS[stream["coding"]]
+            language = stream.get("language", "").strip()
+            if language and not re.fullmatch(r"[A-Za-z]{3}", language):
+                raise ValueError(f"Invalid language for stream PID {stream['pid']}")
+            old = streams.get(key)
+            if old and (old["codec"] != codec or
+                        (language and old["language"] and language != old["language"])):
+                raise ValueError(f"Stream PID {stream['pid']} changes codec or language")
+            streams[key] = {"codec": codec, "language": language or (old["language"] if old else "")}
+    if playlist["angles"] != 1:
+        raise ValueError(f"Playlist has {playlist['angles']} angles")
+    if not any(kind == "video" for kind, _ in streams):
+        raise ValueError("Playlist has no video stream")
+    return streams
+
+
+def probe(path):
+    result = subprocess.run([FFPROBE, "-v", "error", "-show_format", "-show_streams",
+                             "-show_chapters", "-of", "json", str(path)],
+                            capture_output=True, text=True, check=True)
+    return json.loads(result.stdout)
+
+
+def check_packet_timestamps(path):
+    command = [FFPROBE, "-v", "error", "-show_packets",
+               "-show_entries", "packet=stream_index,dts_time", "-of", "csv=p=0", str(path)]
+    with tempfile.TemporaryFile(mode="w+") as errors:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True)
+        previous = {}
+        try:
+            for line in process.stdout:
+                fields = line.strip().split(",")
+                if len(fields) < 2 or fields[1] == "N/A":
+                    continue
+                index, timestamp = int(fields[0]), float(fields[1])
+                if not math.isfinite(timestamp):
+                    raise ValueError(f"Invalid packet timestamp in stream {index}")
+                if index in previous and timestamp <= previous[index]:
+                    raise ValueError(
+                        f"Non-increasing DTS in stream {index}: {previous[index]:.6f}s then {timestamp:.6f}s"
+                    )
+                previous[index] = timestamp
+        except (ValueError, OSError):
+            process.terminate()
+            process.wait()
+            raise
+        finally:
+            process.stdout.close()
+        if process.wait():
+            errors.seek(0)
+            raise ValueError(f"Packet inspection failed: {errors.read().strip()}")
+
+
+def completeness(playlist, media):
+    expected = expected_streams(playlist)
+    try:
+        duration = float(media["format"]["duration"])
+        chapters = [float(c["start_time"]) for c in media.get("chapters", [])]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid media metadata: {exc}") from exc
+    if not math.isfinite(duration) or abs(duration - playlist["duration"]) > 1 + playlist["duration"] * 0.0015:
+        raise ValueError(f"Duration mismatch: expected {playlist['duration']:.3f}s, found {duration:.3f}s")
+    if len(chapters) != len(playlist["chapters"]) or any(
+            not math.isfinite(actual) or abs(actual - expected_time) > 0.15
+            for actual, expected_time in zip(chapters, playlist["chapters"])):
+        raise ValueError(f"Chapter mismatch: expected {playlist['chapters']}, found {chapters}")
+    ordered = sorted(expected, key=lambda key: ({"video": 0, "audio": 1, "subtitle": 2}[key[0]], key[1]))
+    found = [stream for stream in media.get("streams", [])
+             if stream.get("codec_type") in ("video", "audio", "subtitle")]
+    if len(found) != len(ordered):
+        raise ValueError(f"Stream count mismatch: expected {len(ordered)}, found {len(found)}")
+    for stream, key in zip(found, ordered):
+        source_stream = expected[key]
+        language = stream.get("tags", {}).get("language", "")
+        if (stream.get("codec_type") != key[0] or stream.get("codec_name") != source_stream["codec"]
+                or (source_stream["language"] and language != source_stream["language"])):
+            raise ValueError(f"Stream mismatch for PID {key[1]}: expected {source_stream}, found {stream}")
+    return {"duration": duration, "chapters": chapters, "streams": media["streams"]}
+
+
+def receipt_path(path):
+    return path.with_name(path.name + ".receipt.json")
+
+
+def matching_receipt(path, identity, playlist):
+    try:
+        receipt = json.loads(receipt_path(path).read_text())
+        if (receipt.get("version") == 1 and receipt.get("source") == identity
+                and receipt.get("playlist") == playlist and receipt.get("file") == path.name
+                and receipt.get("sha256") == digest(path)
+                and receipt.get("status") in ("complete", "incomplete")):
+            return receipt
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def metadata(path, playlist):
+    lines = [";FFMETADATA1"]
+    chapters = playlist["chapters"]
+    for i, start in enumerate(chapters):
+        end = chapters[i + 1] if i + 1 < len(chapters) else playlist["duration"]
+        lines += ["[CHAPTER]", "TIMEBASE=1/90000", f"START={round(start * 90000)}",
+                  f"END={round(end * 90000)}"]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def extract(source, root, identity, playlists):
+    titles = root / "titles"
+    logs = root / "logs"
+    titles.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    fd = os.open(titles, os.O_RDONLY | os.O_DIRECTORY)
+    failures = 0
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for number, playlist in sorted(playlists.items()):
+            name = f"playlist_{number:05d}.mkv"
+            path = titles / name
+            log = logs / f"playlist_{number:05d}.log"
+            try:
+                streams = expected_streams(playlist)
+                receipt = matching_receipt(path, identity, number)
+                if receipt and receipt["status"] == "complete":
+                    try:
+                        completeness(playlist, probe(path))
+                        check_packet_timestamps(path)
+                    except (ValueError, subprocess.CalledProcessError) as exc:
+                        receipt.update({"status": "incomplete", "error": str(exc)})
+                        atomic_json(receipt_path(path), receipt)
+                        print(f"{name}: existing output is incomplete; re-extracting", file=sys.stderr)
+                    else:
+                        print(f"{name}: already complete", flush=True)
+                        continue
+                with tempfile.TemporaryDirectory(prefix=f".playlist_{number:05d}.", dir=titles) as directory:
+                    work = Path(directory)
+                    meta = work / "chapters.ffmetadata"
+                    temp = work / "output.mkv"
+                    metadata(meta, playlist)
+                    command = [FFMPEG, "-nostdin", "-hide_banner", "-xerror", "-y",
+                               "-playlist", str(number), "-i", "bluray:" + str(source),
+                               "-f", "ffmetadata", "-i", str(meta)]
+                    ordered = sorted(streams, key=lambda key: (
+                        {"video": 0, "audio": 1, "subtitle": 2}[key[0]], key[1]))
+                    for kind, pid in ordered:
+                        command.extend(["-map", f"0:i:0x{pid:x}"])
+                    command.extend(["-map_metadata", "-1", "-map_chapters", "1", "-c", "copy"])
+                    positions = {"video": 0, "audio": 0, "subtitle": 0}
+                    specifiers = {"video": "v", "audio": "a", "subtitle": "s"}
+                    for kind, pid in ordered:
+                        language = streams[(kind, pid)]["language"]
+                        if language:
+                            command.extend([f"-metadata:s:{specifiers[kind]}:{positions[kind]}",
+                                            f"language={language}"])
+                        positions[kind] += 1
+                    command.extend(["-f", "matroska", str(temp)])
+                    with log.open("w") as diagnostics:
+                        result = subprocess.run(command, stdout=diagnostics, stderr=subprocess.STDOUT)
+                    diagnostic_text = log.read_text(errors="replace")
+                    if result.returncode and any(message in diagnostic_text for message in
+                                                 ("dimensions not set", "sample rate not set")):
+                        retry = command.copy()
+                        position = retry.index("-playlist")
+                        retry[position:position] = ["-probesize", "256M", "-analyzeduration", "150M"]
+                        with log.open("a") as diagnostics:
+                            diagnostics.write("\nRetrying with a larger input probe.\n")
+                            diagnostics.flush()
+                            result = subprocess.run(retry, stdout=diagnostics, stderr=subprocess.STDOUT)
+                    if result.returncode:
+                        diagnostics = log.read_text(errors="replace")
+                        reason = next((line.strip() for line in reversed(diagnostics.splitlines())
+                                       if any(message in line for message in
+                                              ("dimensions not set", "sample rate not set",
+                                               "Packet corrupt", "corrupt input packet",
+                                               "Could not write header"))), "")
+                        detail = f": {reason}" if reason else ""
+                        raise ValueError(f"FFmpeg failed ({result.returncode}){detail}; see {log}")
+                    observed = completeness(playlist, probe(temp))
+                    check_packet_timestamps(temp)
+                    checksum = digest(temp)
+                    with temp.open("rb") as handle:
+                        os.fsync(handle.fileno())
+                    receipt_path(path).unlink(missing_ok=True)
+                    os.replace(temp, path)
+                    atomic_json(receipt_path(path), {"version": 1, "status": "complete",
+                        "source": identity, "playlist": number, "file": name,
+                        "sha256": checksum, "expected": playlist, "observed": observed})
+                print(f"{name}: extracted", flush=True)
+            except (ValueError, OSError, subprocess.CalledProcessError, KeyError) as exc:
+                failures += 1
+                with log.open("a") as diagnostics:
+                    diagnostics.write(f"\nExtraction failed: {exc}\n")
+                print(f"{name}: {exc}", file=sys.stderr, flush=True)
+    finally:
+        os.close(fd)
+    return failures
+
+
+def verify(source, root, identity, playlists, menus):
+    titles = root / "titles"
+    if not titles.is_dir():
+        return verify_locked(source, root, identity, playlists, menus)
+    fd = os.open(titles, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return verify_locked(source, root, identity, playlists, menus)
+    finally:
+        os.close(fd)
+
+
+def verify_locked(source, root, identity, playlists, menus):
+    entries = []
+    titles = root / "titles"
+    actual = {p.name for p in titles.glob("*.mkv")} if titles.is_dir() else set()
+    expected = {f"playlist_{n:05d}.mkv" for n in playlists}
+    for name in sorted(expected | actual):
+        path = titles / name
+        entry = {"file": f"titles/{name}", "verified": False}
+        try:
+            if name not in expected:
+                raise ValueError("Unexpected file: absent from source inventory")
+            number = int(name[9:14])
+            playlist = playlists[number]
+            entry.update({"playlist": number, "expected": playlist,
+                          "log": f"logs/playlist_{number:05d}.log"})
+            expected_streams(playlist)
+            if not path.is_file():
+                log_path = root / entry["log"]
+                if log_path.is_file():
+                    for line in reversed(log_path.read_text(errors="replace").splitlines()):
+                        if line.startswith("Extraction failed: "):
+                            entry["extraction_error"] = line.removeprefix("Extraction failed: ")
+                            break
+                raise ValueError("Expected playlist output is missing")
+            receipt = matching_receipt(path, identity, number)
+            if not receipt:
+                raise ValueError("Missing or invalid completion receipt, source mismatch, or checksum mismatch")
+            if receipt["status"] == "incomplete":
+                raise ValueError(receipt.get("error", "Incomplete playlist output; re-extract"))
+            try:
+                entry["observed"] = completeness(playlist, probe(path))
+                check_packet_timestamps(path)
+            except (ValueError, subprocess.CalledProcessError) as exc:
+                receipt.update({"status": "incomplete", "error": str(exc)})
+                atomic_json(receipt_path(path), receipt)
+                raise
+            entry["sha256"] = receipt["sha256"]
+            entry["verified"] = True
+        except (ValueError, OSError, subprocess.CalledProcessError, KeyError) as exc:
+            entry["error"] = str(exc)
+        entries.append(entry)
+        print(f"{name}: {'verified' if entry['verified'] else entry['error']}", file=sys.stderr)
+    failed = sum(not entry["verified"] for entry in entries)
+    report = {"format": "disc-archive-tools blu-ray manifest", "version": 1,
+              "source": {"path": str(source), **identity}, "menus": {
+                  **menus, "interactive_graphics_playlists": [
+                      n for n, p in sorted(playlists.items())
+                      if any(c["interactive_graphics"] for c in p["clips"])],
+                  "preservation": "not yet supported"},
+              "files": entries, "summary": {"files": len(entries),
+                                            "verified": len(entries) - failed, "failed": failed}}
+    path = publish_manifest(root, report)
+    print(f"Verification result: {path}")
+    return int(bool(failed))
+
+
+def main(mode):
+    args = sys.argv[1:]
+    if len(args) not in ({2} if mode == "verify" else {1, 2}):
+        print(f"Usage: bluray-{mode} SOURCE {'OUTPUT' if mode == 'verify' else '[OUTPUT]'}", file=sys.stderr)
+        return 1
+    try:
+        print(f"Fingerprinting source: {args[0]}", flush=True)
+        source, identity = source_details(Path(args[0]))
+        playlists, menus = inventory(source)
+        out = Path(args[1] if len(args) == 2 else "bluray-extract").resolve()
+        if mode == "verify" and not out.is_dir():
+            raise ValueError(f"Not a directory: {out}")
+        if source.is_dir():
+            bdmv = next(p for p in source.iterdir() if p.is_dir() and p.name.upper() == "BDMV")
+            if out == bdmv or bdmv in out.parents:
+                raise ValueError("Output must be outside the source BDMV directory")
+        out.mkdir(parents=True, exist_ok=True)
+        print(f"Discovered {len(playlists)} playlists. Blu-ray menu preservation is not yet supported.", flush=True)
+        if mode == "verify":
+            return verify(source, out, identity, playlists, menus)
+        failures = extract(source, out, identity, playlists)
+        if mode == "extract":
+            failures += verify(source, out, identity, playlists, menus)
+        return int(bool(failures))
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1

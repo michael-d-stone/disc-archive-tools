@@ -2,7 +2,7 @@
 
 `disc-archive-tools` is a collection of free and open-source tools for extracting and preserving the contents of optical media using standard, inspectable file formats.
 
-The project currently supports DVD-Video. Given an already-readable DVD ISO image or DVD directory, it extracts authored titles and playable menu content to Matroska (`.mkv`) files without re-encoding, then verifies the extracted files and produces a manifest describing them.
+The project supports DVD-Video extraction and verification. Initial Blu-ray playlist extraction and verification are available for testing against readable discs.
 
 ## Scope
 
@@ -13,10 +13,9 @@ Acquisition workflows may differ for other supported disc formats. For example, 
 Current support:
 
 - DVD-Video
+- Blu-ray playlist extraction and verification, with unsupported cases reported
 
 Planned support includes:
-
-- Blu-ray (next format)
 - Audio CD
 - Video CD (VCD)
 - Super Video CD (SVCD)
@@ -94,7 +93,38 @@ bd_list_titles -a -l "/path/to/disc.iso"
 
 `-a` lists all titles and `-l` includes language codes. The output shows
 playlist numbers, runtimes, chapter counts, and clip counts. Blu-ray inspection
-is available through this external tool. Blu-ray extraction is planned.
+is available through this external tool.
+
+## Blu-ray usage
+
+Extract and verify every playlist from an already-readable Blu-ray ISO or the
+directory containing `BDMV`:
+
+```bash
+bluray-extract "/path/to/disc-root" "/path/to/output"
+```
+
+`bluray-extract` writes playlist MKVs and source-bound completion receipts in
+`OUTPUT/titles`, FFmpeg diagnostics in `OUTPUT/logs`, and a verification
+manifest in `OUTPUT`. It continues after a playlist fails and exits with a
+nonzero status if any playlist fails verification. An interrupted run can be
+repeated and complete matching playlists are reused.
+
+Use `bluray-title-extract SOURCE [OUTPUT]` for extraction alone and
+`bluray-verify SOURCE OUTPUT` for a separate recheck. The default extraction
+output directory is `bluray-extract/`. Verification preserves the first
+manifest and writes timestamped results on later runs. Each verification reads
+the original source and hashes the ISO or all files in `BDMV`.
+
+The playlist metadata comes from libbluray. Authored chapter marks are written
+to the MKV and checked alongside runtime, stream inventory, packet timestamps,
+and checksums.
+Multiple angles, interactive or timed stills, secondary streams, and
+unsupported codecs are reported for investigation. Interactive graphics and
+Blu-ray Java navigation are listed in the manifest. Blu-ray menu preservation
+is not yet implemented. Verification checks metadata, timestamps, and
+checksums. It does not compare every output packet with the source or perform
+a full decode.
 
 ## DVD-Video usage
 

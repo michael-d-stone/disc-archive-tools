@@ -74,7 +74,7 @@ content. ffprobe is used to inspect and verify extracted Matroska files.
 Run `bd_list_titles -a -l SOURCE` with a Blu-ray ISO or the directory
 containing `BDMV`. This
 inspection step uses the packaged tool independently of the project's FFmpeg
-build. Blu-ray extraction is planned.
+build. The Blu-ray extraction commands inspect playlist metadata through libbluray.
 
 ### libbluray
 

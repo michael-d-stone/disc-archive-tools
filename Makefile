@@ -16,7 +16,7 @@ BINDIR ?= $(PREFIX)/bin
 PROGRAM = build-ifo-dump
 GALLERY_PROGRAM = build-gallery-nav
 BLURAY_PROGRAM = build-bluray-info
-SCRIPTS = scripts/dvd-archive scripts/dvd-title-extract scripts/dvd-menu-extract scripts/dvd-extract scripts/dvd-verify scripts/dvd-gallery-extract
+SCRIPTS = scripts/dvd-archive scripts/dvd-title-extract scripts/dvd-menu-extract scripts/dvd-extract scripts/dvd-verify scripts/dvd-gallery-extract scripts/bluray-archive scripts/bluray-extract scripts/bluray-title-extract scripts/bluray-verify
 
 .PHONY: all disc-archive-tools clean install install-disc-archive-tools uninstall test test-fixtures ffmpeg install-ffmpeg
 
@@ -58,7 +58,11 @@ uninstall:
 		"$(DESTDIR)$(BINDIR)/dvd-verify" \
 		"$(DESTDIR)$(BINDIR)/dvd-gallery-nav" \
 		"$(DESTDIR)$(BINDIR)/dvd-gallery-extract" \
-		"$(DESTDIR)$(BINDIR)/bluray-info"
+		"$(DESTDIR)$(BINDIR)/bluray-info" \
+		"$(DESTDIR)$(BINDIR)/bluray-archive" \
+		"$(DESTDIR)$(BINDIR)/bluray-extract" \
+		"$(DESTDIR)$(BINDIR)/bluray-title-extract" \
+		"$(DESTDIR)$(BINDIR)/bluray-verify"
 
 test:
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
