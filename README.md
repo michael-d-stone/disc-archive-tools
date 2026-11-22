@@ -56,6 +56,37 @@ sudo make install-disc-archive-tools
 
 The FFmpeg build is installed under `/opt/ffmpeg-dvd`. The disc-archive-tools commands are installed under `/usr/local/bin`.
 
+## Inspect a disc
+
+List the titles and chapters on an already-readable DVD ISO or DVD directory:
+
+```bash
+lsdvd -c "/path/to/disc.iso"
+```
+
+For optional Blu-ray inspection on Debian 12, install the package that provides
+`bd_list_titles`:
+
+```bash
+sudo apt install libbluray-bin
+```
+
+Point it at the directory containing `BDMV`:
+
+```bash
+bd_list_titles -a -l "/path/to/disc-root"
+```
+
+It also accepts a Blu-ray ISO directly:
+
+```bash
+bd_list_titles -a -l "/path/to/disc.iso"
+```
+
+`-a` lists all titles and `-l` includes language codes. The output shows
+playlist numbers, runtimes, chapter counts, and clip counts. Blu-ray inspection
+is available through this external tool. Blu-ray extraction is planned.
+
 ## DVD-Video usage
 
 Extract an already-readable DVD ISO:

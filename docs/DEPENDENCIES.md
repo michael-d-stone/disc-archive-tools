@@ -66,6 +66,16 @@ content. ffprobe is used to inspect and verify extracted Matroska files.
 
 `dvd-title-extract` uses lsdvd to enumerate DVD titles before extraction.
 
+### bd_list_titles
+
+- Debian 12 package: [libbluray-bin](https://packages.debian.org/bookworm/amd64/libbluray-bin/filelist)
+- Use: optional external executable for manual Blu-ray inspection
+
+Run `bd_list_titles -a -l SOURCE` with a Blu-ray ISO or the directory
+containing `BDMV`. This
+inspection step uses the packaged tool independently of the project's FFmpeg
+build. Blu-ray extraction is planned.
+
 ## Runtime dependencies
 
 ### Bash
