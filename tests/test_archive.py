@@ -345,9 +345,16 @@ class ArchiveTests(unittest.TestCase):
                 archive.compare_packet_stream(self.source, ['-title', '1'], self.root / 'out.mkv',
                                               0, 0, [None], {}, {None: 2}, 'video')
             output_packets[-1] = packet(1, "b")
-            with self.assertRaisesRegex(archive.SourceComparisonError, 'ended early'):
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'Authored DVD metadata'):
                 archive.compare_packet_stream(self.source, ['-title', '1'], self.root / 'out.mkv',
                                               0, 0, [None], {}, {None: 10}, 'video')
+            warnings = []
+            counts = archive.compare_packet_stream(
+                self.source, ['-title', '1'], self.root / 'out.mkv', 0, 0,
+                [None], {}, {None: 10}, 'video',
+                duration_warnings=warnings, require_duration_match=False)
+            self.assertEqual(counts, [2])
+            self.assertIn('metadata reports 10.000s', warnings[0])
             output_packets[-1]["pts_time"] = "1.1"
             with self.assertRaisesRegex(archive.SourceComparisonError, 'pts_time differs'):
                 archive.compare_packet_stream(self.source, ['-title', '1'], self.root / 'out.mkv',
@@ -399,6 +406,114 @@ class ArchiveTests(unittest.TestCase):
             result = self.real_compare_dvd(self.source, ['-title', '1'], output, title)
         self.assertEqual(result['method'], 'chapters')
         self.assertEqual(result['streams'][0]['packets'], 2)
+
+    def test_matching_media_with_authored_length_difference_is_verified_with_warning(self):
+        self.extract()
+        self.media = {'verified': True, 'duration': 12.0, 'chapter_count': 0}
+        with patch.object(self, 'inventories',
+                          side_effect=lambda source, kind: self.options if kind == 'title' else {}):
+            status, manifest = self.verify()
+        entry = next(item for item in manifest['files'] if item['kind'] == 'title')
+        self.assertTrue(entry['verified'])
+        self.assertIn('10.000s', entry['warnings'][0])
+        self.assertIn('12.000s', entry['warnings'][0])
+        self.assertTrue(entry['source_comparison']['verified'])
+        self.assertEqual(manifest['summary']['warnings'], 1)
+        receipt = json.loads((self.titles / 'title_001.mkv.receipt.json').read_text())
+        self.assertEqual(receipt['status'], 'complete')
+        self.assertEqual(receipt['warnings'], entry['warnings'])
+        self.assertEqual(status, 0)
+
+    def test_short_matching_whole_read_checks_all_chapters(self):
+        video = {"index": 0, "codec_type": "video", "codec_name": "mpeg2video"}
+        output = self.root / 'out.mkv'
+        media = {"streams": [video], "chapter_starts": [0, 10]}
+        title = (1, 20.0, [10.0, 10.0])
+        unreadable = False
+
+        @contextlib.contextmanager
+        def records(command, prefix):
+            packet = {"pts_time": "0", "dts_time": "0", "duration_time": "1",
+                      "data_hash": "first"}
+            if "-chapter_start" in command and command[command.index("-chapter_start") + 1] == "2":
+                if unreadable:
+                    yield iter([])
+                    return
+                packet = dict(packet, data_hash="second")
+            yield iter([packet])
+
+        with patch.object(archive, 'probe_dvd_streams', return_value=[video]), \
+             patch.object(archive, 'probe', return_value=media), \
+             patch.object(archive, 'probe_records', side_effect=records):
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'output ended early'):
+                self.real_compare_dvd(self.source, ['-title', '1'], output, title)
+            unreadable = True
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'chapter 2 is empty'):
+                self.real_compare_dvd(self.source, ['-title', '1'], output, title)
+
+    def test_matching_chapters_report_authored_duration_warnings(self):
+        video = {"index": 0, "codec_type": "video", "codec_name": "mpeg2video"}
+        output = self.root / 'out.mkv'
+        media = {"streams": [video], "chapter_starts": [0, 1]}
+        title = (1, 20.0, [10.0, 10.0])
+
+        @contextlib.contextmanager
+        def records(command, prefix):
+            first = {"pts_time": "0", "dts_time": "0", "duration_time": "1", "data_hash": "a"}
+            second = {"pts_time": "1", "dts_time": "1", "duration_time": "1", "data_hash": "b"}
+            if command[-1] == str(output):
+                data = [first, second]
+            elif "-chapter_start" in command and command[command.index("-chapter_start") + 1] == "2":
+                data = [dict(second, pts_time="0", dts_time="0")]
+            else:
+                data = [first]
+            yield iter(data)
+
+        with patch.object(archive, 'probe_dvd_streams', return_value=[video]), \
+             patch.object(archive, 'probe', return_value=media), \
+             patch.object(archive, 'probe_records', side_effect=records):
+            result = self.real_compare_dvd(self.source, ['-title', '1'], output, title)
+        self.assertTrue(result['verified'])
+        self.assertEqual(result['method'], 'chapters')
+        self.assertEqual(len(result['warnings']), 2)
+        self.assertIn('chapter 2', result['warnings'][1])
+
+    def test_source_comparison_failure_retries_multichapter_extraction(self):
+        self.options['title_001.mkv'] = (1, 10.0, [5.0, 5.0])
+        self.media = {'verified': True, 'duration': 10.0, 'chapter_count': 2}
+        self.comparison.side_effect = [
+            archive.SourceComparisonError('packet mismatch'),
+            {'verified': True, 'method': 'chapters', 'streams': []},
+        ]
+        with patch.object(archive, 'recover_chapters') as recover:
+            self.extract()
+        recover.assert_called_once()
+        receipt = json.loads((self.titles / 'title_001.mkv.receipt.json').read_text())
+        self.assertEqual(receipt['status'], 'complete')
+        self.assertEqual(receipt['source_comparison']['method'], 'chapters')
+
+    def test_chapter_recovery_warns_about_authored_duration(self):
+        output = self.root / 'joined.mkv'
+
+        def remux(source, options, destination):
+            destination.write_bytes(b'chapter')
+
+        def join(command, **kwargs):
+            output.write_bytes(b'joined')
+            return subprocess.CompletedProcess(command, 0)
+
+        def counts(path):
+            return {0: 2 if path == output else 1}
+
+        diagnostics = io.StringIO()
+        with patch.object(archive, 'remux_dvd', side_effect=remux), \
+             patch.object(archive, 'probe', return_value={'duration': 2.0, 'streams': []}), \
+             patch.object(archive, 'packet_counts', side_effect=counts), \
+             patch.object(archive.subprocess, 'run', side_effect=join), \
+             contextlib.redirect_stderr(diagnostics):
+            archive.recover_chapters(self.source, (1, 20.0, [10.0, 10.0]), output)
+        self.assertTrue(output.exists())
+        self.assertIn('authored DVD metadata reports 10.000s', diagnostics.getvalue())
 
     def test_pcm_comparison_matches_samples_despite_repacketization(self):
         ffmpeg = Path(archive.FFMPEG)

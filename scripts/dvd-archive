@@ -234,11 +234,18 @@ def completeness(title, observed):
     count_ok = actual["chapter_count"] == len(chapters) or (
         len(chapters) == 1 and actual["chapter_count"] == 0
     )
-    if not duration_matches(duration, actual["duration"]) or not count_ok:
+    if actual["duration"] is None or not math.isfinite(actual["duration"]):
+        result["error"] = "Extracted media has no usable duration"
+    elif not count_ok:
         result["error"] = (
             f"Expected {duration:.3f}s and {len(chapters)} chapters; "
             f"found {actual['duration']}s and {actual['chapter_count']} chapters"
         )
+    elif not duration_matches(duration, actual["duration"]):
+        result["warnings"] = [
+            f"Authored DVD metadata reports {duration:.3f}s; "
+            f"the extracted media reports {actual['duration']:.3f}s"
+        ]
     return result
 
 
@@ -292,8 +299,12 @@ def recover_chapters(source, title, destination):
                 remux_dvd(source, options, segment)
                 observed = probe(segment)
                 duration = observed["duration"]
-                if not duration_matches(expected, duration) or duration <= 0:
-                    raise ValueError(f"expected {expected:.3f}s, found {duration}s")
+                if duration is None or not math.isfinite(duration) or duration <= 0:
+                    raise ValueError(f"chapter has no usable duration: {duration}")
+                if not duration_matches(expected, duration):
+                    print(f"Warning: chapter {chapter}: authored DVD metadata reports "
+                          f"{expected:.3f}s; extracted media reports {duration:.3f}s",
+                          file=sys.stderr)
                 if streams is not None and streams != observed["streams"]:
                     raise ValueError("stream layout differs from the first chapter")
                 streams = observed["streams"]
@@ -633,7 +644,8 @@ def timestamp(record, field):
 
 
 def compare_packet_stream(source, options, output, source_index, output_index,
-                          chapter_numbers, offsets, expected_durations, kind):
+                          chapter_numbers, offsets, expected_durations, kind,
+                          duration_warnings=None, require_duration_match=True):
     output_args = [str(output)]
     output_command = packet_command(output_args, output_index)
     counts = []
@@ -694,10 +706,15 @@ def compare_packet_stream(source, options, output, source_index, output_index,
                         f"Video source chapter {chapter or 'whole'} has no usable duration"
                     )
                 if duration is not None and not duration_matches(duration, last_end - first_pts):
-                    raise SourceComparisonError(
-                        f"Video source chapter {chapter or 'whole'} ended early: "
-                        f"expected {duration:.3f}s, read {last_end - first_pts:.3f}s"
+                    message = (
+                        f"Authored DVD metadata reports {duration:.3f}s for "
+                        f"{'chapter ' + str(chapter) if chapter is not None else 'the title'}; "
+                        f"the source video packets span {last_end - first_pts:.3f}s"
                     )
+                    if require_duration_match:
+                        raise SourceComparisonError(message)
+                    if duration_warnings is not None:
+                        duration_warnings.append(message)
             counts.append(count)
         if next(output_records, None) is not None:
             raise SourceComparisonError(f"{kind} stream {output_index}: output has extra packets")
@@ -836,9 +853,14 @@ def compare_dvd_media(source, options, output, title=None, chapters=False):
                  if chapters else {None: title[1]} if title else {})
     offsets = {}
     comparison = {"verified": True, "method": "chapters" if chapters else "whole", "streams": []}
+    duration_warnings = []
     original, actual = videos[0]
     counts = compare_packet_stream(source, options, output, original["index"], actual["index"],
-                                   chapter_numbers, offsets, durations, "video")
+                                   chapter_numbers, offsets, durations, "video",
+                                   duration_warnings=duration_warnings,
+                                   require_duration_match=bool(title and len(title[2]) > 1 and not chapters))
+    if duration_warnings:
+        comparison["warnings"] = duration_warnings
     if chapters:
         starts = observed["chapter_starts"]
         if len(starts) != len(chapter_numbers) or any(
@@ -914,6 +936,8 @@ def extract(source, out, kind):
                     comparison = compare_dvd(source, options, path, title)
                     write_receipt(path, identity, receipt["sha256"], check, comparison)
                     print(f"Source comparison passed; skipping {path}")
+                    for warning in (check or {}).get("warnings", []) + comparison.get("warnings", []):
+                        print(f"Warning: {path}: {warning}", file=sys.stderr)
                     continue
                 except (ValueError, OSError, subprocess.CalledProcessError) as exc:
                     comparison = {"verified": False, "error": str(exc)}
@@ -926,19 +950,33 @@ def extract(source, out, kind):
                 remux_dvd(source, options, temporary)
                 observed = probe(temporary)
                 check = completeness(title, observed) if title else None
+                recovered = False
                 if check and "error" in check and len(title[2]) > 1:
                     print(f"{name}: {check['error']}. Retrying by chapter.", file=sys.stderr)
                     recover_chapters(source, title, temporary)
+                    recovered = True
                     check = completeness(title, probe(temporary))
                 if check and "error" in check:
                     raise ValueError(f"{name}: {check['error']}")
-                comparison = compare_dvd(source, options, temporary, title)
+                try:
+                    comparison = compare_dvd(source, options, temporary, title)
+                except SourceComparisonError:
+                    if not title or len(title[2]) <= 1 or recovered:
+                        raise
+                    print(f"{name}: source comparison failed. Retrying by chapter.", file=sys.stderr)
+                    recover_chapters(source, title, temporary)
+                    check = completeness(title, probe(temporary))
+                    if "error" in check:
+                        raise ValueError(f"{name}: {check['error']}")
+                    comparison = compare_dvd(source, options, temporary, title)
                 checksum = digest(temporary)
                 with temporary.open("rb") as handle:
                     os.fsync(handle.fileno())
                 receipt_path(path).unlink(missing_ok=True)
                 os.replace(temporary, path)
                 write_receipt(path, identity, checksum, check, comparison)
+                for warning in (check or {}).get("warnings", []) + comparison.get("warnings", []):
+                    print(f"Warning: {path}: {warning}", file=sys.stderr)
             finally:
                 temporary.unlink(missing_ok=True)
     finally:
@@ -1007,6 +1045,8 @@ def verify(source, root):
                     write_receipt(path, identity, receipt["sha256"], check, comparison)
                     raise
                 entry["source_comparison"] = comparison
+                if comparison.get("warnings"):
+                    entry["warnings"] = [*entry.get("warnings", []), *comparison["warnings"]]
                 write_receipt(path, identity, receipt["sha256"], check, comparison)
             finally:
                 os.close(fd)
@@ -1015,10 +1055,13 @@ def verify(source, root):
             entry["error"] = str(exc)
         entries.append(entry)
         print(f"{name}: {'verified' if entry['verified'] else entry['error']}", file=sys.stderr)
+        for warning in entry.get("warnings", []):
+            print(f"{name}: warning: {warning}", file=sys.stderr)
     failures = sum(not e["verified"] for e in entries)
     manifest = {"format": "disc-archive-tools dvd-video manifest", "version": 2,
                 "source": {"path": str(source.resolve()), **identity}, "files": entries,
-                "summary": {"files": len(entries), "verified": len(entries) - failures, "failed": failures}}
+                "summary": {"files": len(entries), "verified": len(entries) - failures, "failed": failures,
+                            "warnings": sum(bool(e.get("warnings")) for e in entries)}}
     path = publish_manifest(root, manifest)
     print(f"Verification result: {path}")
     return 1 if failures or not expected else 0

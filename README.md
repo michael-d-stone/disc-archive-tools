@@ -153,14 +153,17 @@ dvd-extract "/path/to/disc.iso" "/path/to/output"
 
 After extraction, the output is verified with `ffprobe` and a `manifest.json` file is created describing the extracted files. Later verification runs preserve that original and write a new `verified-YYYY-MM-DD-HHMMSS-UTC.json` file in the output directory, with a numeric suffix if needed. The command prints the result path, including for failed checks.
 
-An interrupted extraction can be run again. Files are skipped only when a completion receipt matches the DVD source fingerprint and output SHA-256 checksum, and a fresh source comparison passes. Missing, changed, or unreceipted files are extracted again. Each extraction writes a temporary file and publishes the final MKV only after FFmpeg succeeds, the result can be probed, and its media matches the DVD source. Title checks also compare the MKV runtime and chapter count against the authored DVD metadata. A single-chapter title may use the whole MKV as its implicit chapter. A checksummed title that falls short is recorded as incomplete and retried. When the whole-title read returns an incomplete multi-chapter MKV, extraction retries with bounded chapter reads and checks packet counts across the join. Existing archives without receipts must be re-extracted.
+An interrupted extraction can be run again. Files are skipped only when a completion receipt matches the DVD source fingerprint and output SHA-256 checksum, and a fresh source comparison passes. Missing, changed, or unreceipted files are extracted again. Each extraction writes a temporary file and publishes the final MKV only after FFmpeg succeeds, the result can be probed, and its media matches the DVD source. Title checks also compare the MKV runtime and chapter count against the authored DVD metadata. A single-chapter title may use the whole MKV as its implicit chapter. When the whole-title read returns an incomplete multi-chapter MKV, extraction retries with bounded chapter reads and checks packet counts across the join. Existing archives without receipts must be re-extracted.
 
 DVD title and menu verification rereads the source. It compares copied packet
 contents, order, and presentation timing, and compares decoded PCM samples
 normalized to 32 bits and their timing for DVD LPCM audio. When a whole-title source read
 ends early, it checks the authored chapters individually. Comparison results
 are stored in the receipt and manifest. A failed or unsupported comparison is
-reported as unverified. Source comparison adds disc reads and processing time.
+reported as unverified. If accessible source media matches the MKV but its
+duration differs from the authored DVD metadata, the result is verified with
+a warning showing the differing durations. The warning does not establish why
+they differ. Source comparison adds disc reads and processing time.
 
 ### Interactive still galleries
 
