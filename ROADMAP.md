@@ -35,26 +35,29 @@ disc's holds during testing.
 
 ## Blu-ray — next format
 
-### Feasibility
+### Playlist extraction — in progress
 
-Evaluate available tools on already-readable Blu-ray sources. Start with a
-straightforward feature and a multi-clip playlist. Check whether the tools
-discover authored titles, follow clip order, and expose streams and chapters.
-Test a representative alternate cut or branching title before claiming support
-for that behavior.
+The Blu-ray commands inventory authored playlists with libbluray, extract
+supported streams with FFmpeg, and verify source fingerprints, chapters,
+runtime, streams, checksums, and packet timestamps. The manifest identifies
+interactive graphics and BD-J titles. Menu preservation remains open.
 
-### First release
+Initial staging runs on Its A Mommy Thing 5 and Breakin Em In 9 found
+playlist-boundary problems. Several audio streams contain distinct packets
+with identical DTS values at a clip transition. On Its A Mommy Thing 5
+playlist 00001, the corresponding source packets have different timestamps.
+Using FFmpeg's `-copyts` retains those audio timestamps in a test, but leaves
+the output with an incorrect duration. FFmpeg also failed to read some VC-1
+dimensions or audio parameters, and reported corrupt packets on another
+playlist. A larger probe lets some files proceed, but it does not resolve
+all failures. These outputs need further investigation before the workflow
+can be considered complete for these discs.
 
-Use the feasibility results to define supported input forms, playlist
-selection, output naming, and how unsupported cases are reported. Extract
-authored titles to Matroska with stream copy where supported. Defer acquisition,
-decryption, and interactive menus.
-
-Verification should check source identity, expected title inventory, output
-checksums, and media readability. Release when representative sources pass
-extraction and verification, regression tests detect missing or changed
-outputs, and the commands, output layout, and verification limits are
-documented.
+Next, establish a lossless way to handle clip boundaries and dynamic stream
+changes, then re-extract and check video and audio continuity. Test alternate
+angles, branching, additional codecs, and a representative ISO before
+claiming support. Blu-ray menu extraction and interactive navigation remain
+separate follow-up work.
 
 ## Format backlog
 
