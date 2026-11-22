@@ -645,7 +645,8 @@ def timestamp(record, field):
 
 def compare_packet_stream(source, options, output, source_index, output_index,
                           chapter_numbers, offsets, expected_durations, kind,
-                          duration_warnings=None, require_duration_match=True):
+                          duration_warnings=None, require_duration_match=True,
+                          allow_output_tail=False):
     output_args = [str(output)]
     output_command = packet_command(output_args, output_index)
     counts = []
@@ -716,12 +717,15 @@ def compare_packet_stream(source, options, output, source_index, output_index,
                     if duration_warnings is not None:
                         duration_warnings.append(message)
             counts.append(count)
-        if next(output_records, None) is not None:
+        if allow_output_tail:
+            for _ in output_records:
+                pass
+        elif next(output_records, None) is not None:
             raise SourceComparisonError(f"{kind} stream {output_index}: output has extra packets")
     return counts
 
 
-def pcm_hash(source, options_list, output, source_index, output_index, sample_fmt):
+def pcm_hash(source, options_list, output, source_index, output_index, sample_fmt, prefix=False):
     if sample_fmt not in ("s16", "s32"):
         raise SourceComparisonError(f"Unsupported DVD LPCM sample format: {sample_fmt}")
     # Normalize both sides to 32 bits so a change from 16- to 20/24-bit
@@ -729,7 +733,7 @@ def pcm_hash(source, options_list, output, source_index, output_index, sample_fm
     codec = "pcm_s32le"
     raw_format = "s32le"
 
-    def update_samples(hasher, input_args, index):
+    def update_samples(hasher, input_args, index, hash_limit=None):
         read_fd, write_fd = os.pipe()
         with tempfile.TemporaryFile(mode="w+") as errors:
             command = [FFMPEG, "-nostdin", "-v", "error", "-xerror", *input_args[:-1],
@@ -747,7 +751,7 @@ def pcm_hash(source, options_list, output, source_index, output_index, sample_fm
             try:
                 with os.fdopen(read_fd, "rb") as samples:
                     for block in iter(lambda: samples.read(1024 * 1024), b""):
-                        hasher.update(block)
+                        hasher.update(block if hash_limit is None else block[:max(0, hash_limit - total)])
                         total += len(block)
                 if process.wait():
                     errors.seek(0)
@@ -760,16 +764,17 @@ def pcm_hash(source, options_list, output, source_index, output_index, sample_fm
 
     before, after = hashlib.sha256(), hashlib.sha256()
     input_bytes = sum(update_samples(before, dvd_input(source, opts), source_index) for opts in options_list)
-    output_bytes = update_samples(after, [str(output)], output_index)
+    output_bytes = update_samples(after, [str(output)], output_index, input_bytes if prefix else None)
     if not input_bytes:
         raise SourceComparisonError(f"PCM stream {source_index}: source produced no samples")
-    if input_bytes != output_bytes or before.digest() != after.digest():
+    if (output_bytes < input_bytes or (not prefix and input_bytes != output_bytes)
+            or before.digest() != after.digest()):
         raise SourceComparisonError(f"PCM stream {source_index}: decoded samples differ from source")
     return input_bytes
 
 
 def compare_pcm_timing(source, options_list, output, source_index, output_index, sample_rate,
-                       offsets, chapters, sample_fmt, channels):
+                       offsets, chapters, sample_fmt, channels, allow_output_tail=False):
     try:
         rate = int(sample_rate)
         if rate <= 0:
@@ -819,7 +824,10 @@ def compare_pcm_timing(source, options_list, output, source_index, output_index,
                         output_used += matched
                         if output_used == output_samples:
                             current = None
-        if current is not None or next(output_frames, None) is not None:
+        if allow_output_tail:
+            for _ in output_frames:
+                pass
+        elif current is not None or next(output_frames, None) is not None:
             raise SourceComparisonError("PCM output has extra decoded samples")
 
 
@@ -893,6 +901,38 @@ def compare_dvd_media(source, options, output, title=None, chapters=False):
     return comparison
 
 
+def compare_whole_prefix(source, options, output):
+    """Ensure chapter reads did not omit anything the continuous read exposes."""
+    source_streams = probe_dvd_streams(source, ["-f", "dvdvideo", *options])
+    output_streams = probe(output)["streams"]
+    if len(source_streams) != len(output_streams):
+        raise SourceComparisonError("DVD and MKV stream counts differ")
+    pairs = list(zip(source_streams, output_streams))
+    videos = [(original, actual) for original, actual in pairs if original.get("codec_type") == "video"]
+    if len(videos) != 1:
+        raise SourceComparisonError("Source comparison requires one identifiable video stream")
+    offsets = {}
+    original, actual = videos[0]
+    compare_packet_stream(source, options, output, original["index"], actual["index"],
+                          [None], offsets, {}, "video", allow_output_tail=True)
+    for original, actual in pairs:
+        kind = original.get("codec_type")
+        if kind == "video":
+            continue
+        if kind not in ("audio", "subtitle"):
+            raise SourceComparisonError(f"Unsupported source stream type: {kind}")
+        if original.get("codec_name") == "pcm_dvd":
+            pcm_hash(source, [options], output, original["index"], actual["index"],
+                     original.get("sample_fmt"), prefix=True)
+            compare_pcm_timing(source, [options], output, original["index"], actual["index"],
+                               original.get("sample_rate"), offsets, [None],
+                               original.get("sample_fmt"), original.get("channels"),
+                               allow_output_tail=True)
+        else:
+            compare_packet_stream(source, options, output, original["index"], actual["index"],
+                                  [None], offsets, {}, kind, allow_output_tail=True)
+
+
 def compare_dvd(source, options, output, title=None):
     try:
         return compare_dvd_media(source, options, output, title)
@@ -900,7 +940,10 @@ def compare_dvd(source, options, output, title=None):
         if not title or len(title[2]) <= 1:
             raise
         try:
-            return compare_dvd_media(source, options, output, title, chapters=True)
+            comparison = compare_dvd_media(source, options, output, title, chapters=True)
+            compare_whole_prefix(source, options, output)
+            comparison["whole_source_prefix_checked"] = True
+            return comparison
         except SourceComparisonError as chapter_error:
             raise SourceComparisonError(
                 f"Whole-title comparison failed: {whole_error}; chapter comparison failed: {chapter_error}"

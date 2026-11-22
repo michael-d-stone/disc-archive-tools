@@ -406,6 +406,39 @@ class ArchiveTests(unittest.TestCase):
             result = self.real_compare_dvd(self.source, ['-title', '1'], output, title)
         self.assertEqual(result['method'], 'chapters')
         self.assertEqual(result['streams'][0]['packets'], 2)
+        self.assertTrue(result['whole_source_prefix_checked'])
+
+    def test_chapter_comparison_rejects_audio_omitted_by_chapter_reads(self):
+        video = {"index": 0, "codec_type": "video", "codec_name": "mpeg2video"}
+        audio = {"index": 1, "codec_type": "audio", "codec_name": "ac3"}
+        output = self.root / 'out.mkv'
+        media = {"streams": [video, audio], "chapter_starts": [0, 1]}
+        title = (1, 2.0, [1.0, 1.0])
+
+        def packet(pts, digest):
+            return {"pts_time": str(pts), "dts_time": str(pts),
+                    "duration_time": "1", "data_hash": digest}
+
+        @contextlib.contextmanager
+        def records(command, prefix):
+            is_output = command[-1] == str(output)
+            chapter = (int(command[command.index('-chapter_start') + 1])
+                       if '-chapter_start' in command else None)
+            stream = int(command[command.index('-select_streams') + 1])
+            if stream == 0:
+                data = ([packet(0, 'a'), packet(1, 'b')] if is_output or chapter is None
+                        else [packet(0, 'a' if chapter == 1 else 'b')])
+            else:
+                data = ([packet(0, 'audio')] if is_output or chapter == 1
+                        else [] if chapter == 2
+                        else [packet(0, 'audio'), packet(1, 'missing')])
+            yield iter(data)
+
+        with patch.object(archive, 'probe_dvd_streams', return_value=[video, audio]), \
+             patch.object(archive, 'probe', return_value=media), \
+             patch.object(archive, 'probe_records', side_effect=records):
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'audio stream 1.*output ended early'):
+                self.real_compare_dvd(self.source, ['-title', '1'], output, title)
 
     def test_matching_media_with_authored_length_difference_is_verified_with_warning(self):
         self.extract()
