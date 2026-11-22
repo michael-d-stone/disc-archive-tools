@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Extract and verify authored Blu-ray playlists."""
 import fcntl
+from contextlib import ExitStack
+from itertools import zip_longest
 import json
 import math
 import os
@@ -26,6 +28,9 @@ CODECS = {
     0x03: "mp3", 0x04: "mp3", 0x80: "pcm_bluray", 0x81: "ac3", 0x82: "dts",
     0x83: "truehd", 0x84: "eac3", 0x85: "dts", 0x86: "dts", 0x90: "hdmv_pgs_subtitle",
 }
+
+class TimestampDiscontinuity(ValueError):
+    """An output packet has a repeated or backwards decoding timestamp."""
 
 
 def source_details(source):
@@ -139,7 +144,7 @@ def check_packet_timestamps(path):
                 if not math.isfinite(timestamp):
                     raise ValueError(f"Invalid packet timestamp in stream {index}")
                 if index in previous and timestamp <= previous[index]:
-                    raise ValueError(
+                    raise TimestampDiscontinuity(
                         f"Non-increasing DTS in stream {index}: {previous[index]:.6f}s then {timestamp:.6f}s"
                     )
                 previous[index] = timestamp
@@ -206,6 +211,88 @@ def metadata(path, playlist):
         lines += ["[CHAPTER]", "TIMEBASE=1/90000", f"START={round(start * 90000)}",
                   f"END={round(end * 90000)}"]
     path.write_text("\n".join(lines) + "\n")
+
+
+def boundary_correction(playlist, streams):
+    """Identify a two-clip video transition with audio confined to the first clip."""
+    clips = playlist["clips"]
+    if len(clips) != 2 or len(streams) != 2:
+        return None
+    video = [key for key in streams if key[0] == "video"]
+    audio = [key for key in streams if key[0] == "audio"]
+    if len(video) != 1 or len(audio) != 1:
+        return None
+    first = {(stream["type"], stream["pid"]) for stream in clips[0]["streams"]}
+    second = {(stream["type"], stream["pid"]) for stream in clips[1]["streams"]}
+    if first != set(streams) or second != set(video):
+        return None
+    # MPEG-TS timestamps wrap at 2**33 ticks. After the discontinuity, FFmpeg
+    # may expose the new clip in the next wrap instead of playlist time.
+    jump = (2 ** 33) / 90000 + clips[1]["in"] - clips[0]["out"]
+    wrapped_start = clips[1]["start"] + jump
+    if not math.isfinite(jump) or wrapped_start <= playlist["duration"] + 1:
+        return None
+    threshold = (playlist["duration"] + wrapped_start) / 2
+    return {"jump_seconds": jump, "threshold_seconds": threshold,
+            "source_start_seconds": clips[0]["in"]}
+
+
+def compare_boundary_packets(source, number, output, streams, correction):
+    """Compare all source packets, payload hashes and mapped timestamps."""
+    ordered = sorted(streams, key=lambda key: ({"video": 0, "audio": 1}[key[0]], key[1]))
+    counts = {}
+    for kind, pid in ordered:
+        selector = "v:0" if kind == "video" else "a:0"
+        options = ["-show_packets", "-show_entries",
+                   "packet=pts_time,dts_time,duration_time,data_hash",
+                   "-show_data_hash", "sha256", "-of", "compact=p=0:nk=0"]
+        input_command = [FFPROBE, "-v", "error", "-playlist", str(number),
+                         "-select_streams", f"i:0x{pid:x}", *options, "bluray:" + str(source)]
+        output_command = [FFPROBE, "-v", "error", "-select_streams", selector, *options, str(output)]
+        with ExitStack() as stack:
+            input_errors = stack.enter_context(tempfile.TemporaryFile(mode="w+"))
+            output_errors = stack.enter_context(tempfile.TemporaryFile(mode="w+"))
+            processes = []
+            try:
+                for command, errors in ((input_command, input_errors), (output_command, output_errors)):
+                    processes.append(subprocess.Popen(command, stdout=subprocess.PIPE,
+                                                      stderr=errors, text=True))
+                count = 0
+                for source_line, output_line in zip_longest(processes[0].stdout, processes[1].stdout):
+                    if source_line is None or output_line is None:
+                        raise ValueError(f"{kind} packet count differs from the source")
+                    original = dict(field.split("=", 1) for field in source_line.strip().split("|") if "=" in field)
+                    actual = dict(field.split("=", 1) for field in output_line.strip().split("|") if "=" in field)
+                    count += 1
+                    if not original.get("data_hash") or original["data_hash"] != actual.get("data_hash"):
+                        raise ValueError(f"{kind} packet {count} differs from the source")
+                    for field in ("pts_time", "dts_time", "duration_time"):
+                        try:
+                            expected_time = float(original[field])
+                            actual_time = float(actual[field])
+                        except (KeyError, ValueError) as exc:
+                            raise ValueError(f"{kind} packet {count} has no usable {field}") from exc
+                        if field != "duration_time":
+                            expected_time -= correction["source_start_seconds"]
+                            if kind == "video" and expected_time >= correction["threshold_seconds"]:
+                                expected_time -= correction["jump_seconds"]
+                        if (not math.isfinite(expected_time) or not math.isfinite(actual_time)
+                                or abs(expected_time - actual_time) > 0.002):
+                            raise ValueError(f"{kind} packet {count} {field} differs from the source")
+                if not count:
+                    raise ValueError(f"No {kind} packets found")
+                for process, errors in zip(processes, (input_errors, output_errors)):
+                    if process.wait():
+                        errors.seek(0)
+                        raise ValueError(f"{kind} packet comparison failed: {errors.read().strip()}")
+                counts[kind] = count
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.terminate()
+                    process.stdout.close()
+                    process.wait()
+    return counts
 
 
 def extract(source, root, identity, playlists):
@@ -279,15 +366,49 @@ def extract(source, root, identity, playlists):
                         detail = f": {reason}" if reason else ""
                         raise ValueError(f"FFmpeg failed ({result.returncode}){detail}; see {log}")
                     observed = completeness(playlist, probe(temp))
-                    check_packet_timestamps(temp)
+                    correction = None
+                    try:
+                        check_packet_timestamps(temp)
+                    except TimestampDiscontinuity:
+                        correction = boundary_correction(playlist, streams)
+                        if correction is None:
+                            raise
+                        retry = command.copy()
+                        position = retry.index("-playlist")
+                        retry[position:position] = ["-copyts", "-start_at_zero"]
+                        jump = correction["jump_seconds"]
+                        threshold = correction["threshold_seconds"]
+                        expression = (
+                            f"setts=pts=if(gte(PTS*TB\\,{threshold:.9f})\\,PTS-{jump:.9f}/TB\\,PTS):"
+                            f"dts=if(gte(DTS*TB\\,{threshold:.9f})\\,DTS-{jump:.9f}/TB\\,DTS)"
+                        )
+                        retry[-3:-3] = ["-bsf:v", expression]
+                        with log.open("a") as diagnostics:
+                            diagnostics.write(
+                                f"\nRetrying with original timestamps and a {jump:.9f}s "
+                                f"video wrap adjustment at {threshold:.9f}s.\n"
+                            )
+                            diagnostics.flush()
+                            result = subprocess.run(retry, stdout=diagnostics, stderr=subprocess.STDOUT)
+                        if result.returncode:
+                            raise ValueError(f"Timestamp correction failed ({result.returncode}); see {log}")
+                        observed = completeness(playlist, probe(temp))
+                        check_packet_timestamps(temp)
+                        correction["packets_checked"] = compare_boundary_packets(
+                            source, number, temp, streams, correction)
+                        with log.open("a") as diagnostics:
+                            diagnostics.write(f"Source packet comparison passed: {correction['packets_checked']}\n")
                     checksum = digest(temp)
                     with temp.open("rb") as handle:
                         os.fsync(handle.fileno())
                     receipt_path(path).unlink(missing_ok=True)
                     os.replace(temp, path)
-                    atomic_json(receipt_path(path), {"version": 1, "status": "complete",
+                    receipt = {"version": 1, "status": "complete",
                         "source": identity, "playlist": number, "file": name,
-                        "sha256": checksum, "expected": playlist, "observed": observed})
+                        "sha256": checksum, "expected": playlist, "observed": observed}
+                    if correction:
+                        receipt["timestamp_correction"] = correction
+                    atomic_json(receipt_path(path), receipt)
                 print(f"{name}: extracted", flush=True)
             except (ValueError, OSError, subprocess.CalledProcessError, KeyError) as exc:
                 failures += 1

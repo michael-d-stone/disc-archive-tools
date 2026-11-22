@@ -118,7 +118,10 @@ the original source and hashes the ISO or all files in `BDMV`.
 
 The playlist metadata comes from libbluray. Authored chapter marks are written
 to the MKV and checked alongside runtime, stream inventory, packet timestamps,
-and checksums.
+and checksums. For a supported two-clip timestamp-wrap case, extraction retries
+with a video timestamp adjustment and compares every output video and audio
+packet with the source before publishing. The playlist log and receipt record
+the adjustment.
 Multiple angles, interactive or timed stills, secondary streams, and
 unsupported codecs are reported for investigation. Interactive graphics and
 Blu-ray Java navigation are listed in the manifest. Blu-ray menu preservation

@@ -128,6 +128,96 @@ class BluRayTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Non-increasing DTS"):
                 module["check_packet_timestamps"](self.source)
 
+    def test_boundary_retry_requires_matching_source_packets(self):
+        video = {"type": "video", "pid": 4113, "coding": 2}
+        audio = {"type": "audio", "pid": 4352, "coding": 129, "language": "eng"}
+        first = {"id": "00000", "start": 0, "in": 4196.4, "out": 4530.500422222,
+                 "still_mode": 0, "interactive_graphics": 0, "secondary_audio": 0,
+                 "secondary_video": 0, "streams": [video, audio]}
+        second = {"id": "00011", "start": 334.100422222, "in": 600, "out": 601.001,
+                  "still_mode": 0, "interactive_graphics": 0, "secondary_audio": 0,
+                  "secondary_video": 0, "streams": [video]}
+        playlist = {"id": 1, "duration": 335.101422222, "angles": 1,
+                    "chapters": [0, 334.100422222], "clips": [first, second]}
+        media = {"format": {"duration": "335.101"},
+                 "chapters": [{"start_time": "0"}, {"start_time": "334.100"}],
+                 "streams": [{"codec_type": "video", "codec_name": "mpeg2video"},
+                             {"codec_type": "audio", "codec_name": "ac3",
+                              "tags": {"language": "eng"}}]}
+        discontinuity = module["TimestampDiscontinuity"]("Non-increasing DTS")
+        with patch.dict(globals_, {"probe": lambda path: media}), \
+             patch.dict(globals_, {"check_packet_timestamps": unittest.mock.Mock(
+                 side_effect=[discontinuity, None])}), \
+             patch.dict(globals_, {"compare_boundary_packets": lambda *args: {"video": 4, "audio": 5}}), \
+             patch.object(subprocess, "run", side_effect=self.ffmpeg) as ffmpeg:
+            self.assertEqual(extract(self.source, self.out, self.identity, {1: playlist}), 0)
+        self.assertEqual(ffmpeg.call_count, 2)
+        retry = ffmpeg.call_args.args[0]
+        self.assertIn("-copyts", retry)
+        self.assertIn("-bsf:v", retry)
+        receipt = json.loads((self.out / "titles/playlist_00001.mkv.receipt.json").read_text())
+        self.assertEqual(receipt["timestamp_correction"]["packets_checked"], {"video": 4, "audio": 5})
+        self.assertIn("video wrap adjustment", (self.out / "logs/playlist_00001.log").read_text())
+
+        self.source.write_bytes(b"other disc")
+        other_identity = source_details(self.source)[1]
+        with patch.dict(globals_, {"probe": lambda path: media}), \
+             patch.dict(globals_, {"check_packet_timestamps": unittest.mock.Mock(
+                 side_effect=[discontinuity, None])}), \
+             patch.dict(globals_, {"compare_boundary_packets": unittest.mock.Mock(
+                 side_effect=ValueError("audio packet differs from source"))}), \
+             patch.object(subprocess, "run", side_effect=self.ffmpeg):
+            self.assertEqual(extract(self.source, self.out, other_identity, {1: playlist}), 1)
+        self.assertEqual(json.loads(
+            (self.out / "titles/playlist_00001.mkv.receipt.json").read_text())["source"], self.identity)
+
+    def test_boundary_correction_rejects_other_stream_layouts(self):
+        streams = module["expected_streams"](self.playlist)
+        self.assertIsNone(module["boundary_correction"](self.playlist, streams))
+
+    def test_boundary_packet_comparison_checks_hashes_and_mapped_timestamps(self):
+        class FakeProbe:
+            def __init__(self, lines):
+                self.stdout = io.StringIO(lines)
+
+            def poll(self):
+                return 0
+
+            def wait(self):
+                return 0
+
+        source_video = (
+            "pts_time=4196.400000|dts_time=4196.366633|duration_time=0.033367|data_hash=first\n"
+            "pts_time=96043.717689|dts_time=96043.684322|duration_time=0.033367|data_hash=second\n"
+        )
+        output_video = (
+            "pts_time=0.000|dts_time=-0.033|duration_time=0.033|data_hash=first\n"
+            "pts_time=334.100|dts_time=334.067|duration_time=0.033|data_hash=second\n"
+        )
+        source_audio = "pts_time=4196.400|dts_time=4196.400|duration_time=0.032|data_hash=audio\n"
+        output_audio = "pts_time=0.000|dts_time=0.000|duration_time=0.032|data_hash=audio\n"
+        streams = {("video", 4113): {}, ("audio", 4352): {}}
+        correction = {"source_start_seconds": 4196.4, "threshold_seconds": 46091,
+                      "jump_seconds": 91513.2172666667}
+        probes = [FakeProbe(lines) for lines in (source_video, output_video, source_audio, output_audio)]
+        with patch.object(subprocess, "Popen", side_effect=probes):
+            counts = module["compare_boundary_packets"](self.source, 1, self.out, streams, correction)
+        self.assertEqual(counts, {"video": 2, "audio": 1})
+
+        changed = output_video.replace("data_hash=second", "data_hash=changed")
+        with patch.object(subprocess, "Popen", side_effect=[FakeProbe(source_video), FakeProbe(changed)]):
+            with self.assertRaisesRegex(ValueError, "video packet 2 differs"):
+                module["compare_boundary_packets"](self.source, 1, self.out, streams, correction)
+
+        changed = output_video.replace("pts_time=334.100", "pts_time=334.050")
+        with patch.object(subprocess, "Popen", side_effect=[FakeProbe(source_video), FakeProbe(changed)]):
+            with self.assertRaisesRegex(ValueError, "video packet 2 pts_time differs"):
+                module["compare_boundary_packets"](self.source, 1, self.out, streams, correction)
+
+        with patch.object(subprocess, "Popen", side_effect=[FakeProbe(source_video), FakeProbe("")]):
+            with self.assertRaisesRegex(ValueError, "packet count differs"):
+                module["compare_boundary_packets"](self.source, 1, self.out, streams, correction)
+
     def test_incomplete_receipt_keeps_error_visible(self):
         with patch.dict(globals_, {"probe": lambda path: self.media, "check_packet_timestamps": lambda path: None}), \
              patch.object(subprocess, "run", side_effect=self.ffmpeg):
