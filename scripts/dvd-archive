@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Shared DVD extraction implementation; also installed alongside the commands."""
 import fcntl
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -61,7 +62,7 @@ def probe_dvd_streams(source, input_args):
     with tempfile.TemporaryDirectory() as directory:
         report = Path(directory) / "streams.json"
         run([FFPROBE, "-v", "error", *input_args, "-preindex", "0",
-             "-show_entries", "stream=index,codec_name,sample_fmt",
+             "-show_entries", "stream=index,codec_type,codec_name,sample_fmt,sample_rate,channels",
              "-of", "json", "-o", str(report), str(source)])
         return json.loads(report.read_text(encoding="utf-8"))["streams"]
 
@@ -183,7 +184,7 @@ def receipt_path(path):
 def matching_receipt(path, identity):
     try:
         receipt = json.loads(receipt_path(path).read_text())
-        if (receipt.get("version") in (1, 2) and receipt.get("source") == identity
+        if (receipt.get("version") in (1, 2, 3) and receipt.get("source") == identity
                 and receipt.get("file") == path.name
                 and receipt.get("sha256") == digest(path)):
             return receipt
@@ -210,8 +211,12 @@ def probe(path):
         duration = float(data.get("format", {}).get("duration"))
     except (TypeError, ValueError):
         duration = None
+    try:
+        chapter_starts = [float(chapter["start_time"]) for chapter in data.get("chapters", [])]
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ValueError("Invalid MKV chapter timestamps") from exc
     return {"verified": True, "duration": duration,
-            "chapter_count": len(data.get("chapters", [])), "streams": streams}
+            "chapter_count": len(chapter_starts), "chapter_starts": chapter_starts, "streams": streams}
 
 
 def duration_matches(expected, observed):
@@ -237,11 +242,15 @@ def completeness(title, observed):
     return result
 
 
-def write_receipt(path, identity, checksum, check=None):
+def write_receipt(path, identity, checksum, check=None, comparison=None):
     receipt = {"version": 1, "source": identity, "file": path.name, "sha256": checksum}
     if check is not None:
         receipt.update({"version": 2,
                         "status": "incomplete" if "error" in check else "complete", **check})
+    if comparison is not None:
+        receipt.update({"version": 3, "source_comparison": comparison,
+                        "status": "complete" if comparison.get("verified") and
+                        (check is None or "error" not in check) else "incomplete"})
     atomic_json(receipt_path(path), receipt)
 
 
@@ -557,6 +566,325 @@ def publish_gallery(source, title, destination, identity, graph):
     print(f"Gallery exported: {destination / 'index.html'}")
 
 
+class SourceComparisonError(ValueError):
+    """The extracted media could not be matched with the DVD source."""
+
+
+@contextmanager
+def probe_records(command, prefix):
+    """Yield ffprobe records while keeping libdvdread diagnostics out of them."""
+    with tempfile.TemporaryFile(mode="w+") as errors:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors,
+                                   text=True, encoding="utf-8", errors="replace")
+        def records():
+            for line in process.stdout:
+                if not line.startswith(prefix):
+                    continue
+                yield dict(field.split("=", 1) for field in line.strip().split("|") if "=" in field)
+        try:
+            yield records()
+            if process.wait():
+                errors.seek(0)
+                raise SourceComparisonError(f"DVD comparison probe failed: {errors.read().strip()}")
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.stdout.close()
+            process.wait()
+
+
+def dvd_input(source, options):
+    # The chapter index can follow DVD commands and stop before the authored
+    # title ends. Compare using direct reads and, if necessary, chapter reads.
+    filtered = []
+    index = 0
+    while index < len(options):
+        if options[index] == "-preindex":
+            index += 2
+        else:
+            filtered.append(options[index])
+            index += 1
+    return ["-f", "dvdvideo", *filtered, "-preindex", "0", str(source)]
+
+
+def packet_command(input_args, index):
+    return [FFPROBE, "-v", "error", *input_args[:-1], "-select_streams", str(index),
+            "-show_packets", "-show_entries", "packet=pts_time,dts_time,duration_time,data_hash,flags",
+            "-show_data_hash", "sha256", "-of", "compact=p=0:nk=0", input_args[-1]]
+
+
+def frame_command(input_args, index):
+    return [FFPROBE, "-v", "error", *input_args[:-1], "-select_streams", str(index),
+            "-show_frames", "-show_entries", "frame=pts_time,duration_time,nb_samples,sample_fmt,channels",
+            "-of", "compact=p=0:nk=0", input_args[-1]]
+
+
+def timestamp(record, field):
+    value = record.get(field)
+    if value in (None, "N/A"):
+        return None
+    try:
+        value = float(value)
+    except ValueError as exc:
+        raise SourceComparisonError(f"Invalid {field} in DVD comparison") from exc
+    if not math.isfinite(value):
+        raise SourceComparisonError(f"Invalid {field} in DVD comparison")
+    return value
+
+
+def compare_packet_stream(source, options, output, source_index, output_index,
+                          chapter_numbers, offsets, expected_durations, kind):
+    output_args = [str(output)]
+    output_command = packet_command(output_args, output_index)
+    counts = []
+    with probe_records(output_command, "pts_time=") as output_records:
+        for chapter in chapter_numbers:
+            chapter_options = list(options)
+            if chapter is not None:
+                chapter_options.extend(["-chapter_start", str(chapter), "-chapter_end", str(chapter)])
+            source_args = dvd_input(source, chapter_options)
+            source_command = packet_command(source_args, source_index)
+            first_pts = None
+            last_end = None
+            count = 0
+            with probe_records(source_command, "pts_time=") as source_records:
+                for original in source_records:
+                    actual = next(output_records, None)
+                    count += 1
+                    label = f"{kind} stream {source_index}, chapter {chapter or 'whole'}, packet {count}"
+                    if actual is None:
+                        raise SourceComparisonError(f"{label}: output ended early")
+                    if "C" in original.get("flags", "") or "C" in actual.get("flags", ""):
+                        raise SourceComparisonError(f"{label}: source or output packet is corrupt")
+                    if not original.get("data_hash") or original["data_hash"] != actual.get("data_hash"):
+                        raise SourceComparisonError(f"{label}: packet content differs from source")
+                    source_pts = timestamp(original, "pts_time")
+                    output_pts = timestamp(actual, "pts_time")
+                    if kind == "video" and first_pts is None:
+                        if source_pts is None or output_pts is None:
+                            raise SourceComparisonError(f"{label}: missing video timestamp")
+                        first_pts = source_pts
+                        offsets[chapter] = output_pts - source_pts
+                    if chapter not in offsets:
+                        raise SourceComparisonError(f"{label}: cannot establish timestamp offset")
+                    fields = ("pts_time", "duration_time") if kind == "video" else (
+                        "pts_time", "dts_time", "duration_time")
+                    for field in fields:
+                        before = timestamp(original, field)
+                        after = timestamp(actual, field)
+                        if before is None and after is None:
+                            if field == "pts_time":
+                                raise SourceComparisonError(f"{label}: presentation timing is unavailable")
+                            continue
+                        if before is None or after is None:
+                            raise SourceComparisonError(f"{label}: {field} is unavailable for comparison")
+                        expected = before if field == "duration_time" else before + offsets[chapter]
+                        if abs(expected - after) > 0.003:
+                            raise SourceComparisonError(f"{label}: {field} differs from source")
+                    if kind == "video" and source_pts is not None:
+                        duration = timestamp(original, "duration_time") or 0
+                        last_end = max(last_end if last_end is not None else source_pts,
+                                       source_pts + duration)
+            if kind == "video":
+                if not count or first_pts is None or last_end is None:
+                    raise SourceComparisonError(f"Video source chapter {chapter or 'whole'} is empty")
+                duration = expected_durations.get(chapter)
+                if duration is not None and last_end <= first_pts:
+                    raise SourceComparisonError(
+                        f"Video source chapter {chapter or 'whole'} has no usable duration"
+                    )
+                if duration is not None and not duration_matches(duration, last_end - first_pts):
+                    raise SourceComparisonError(
+                        f"Video source chapter {chapter or 'whole'} ended early: "
+                        f"expected {duration:.3f}s, read {last_end - first_pts:.3f}s"
+                    )
+            counts.append(count)
+        if next(output_records, None) is not None:
+            raise SourceComparisonError(f"{kind} stream {output_index}: output has extra packets")
+    return counts
+
+
+def pcm_hash(source, options_list, output, source_index, output_index, sample_fmt):
+    if sample_fmt not in ("s16", "s32"):
+        raise SourceComparisonError(f"Unsupported DVD LPCM sample format: {sample_fmt}")
+    # Normalize both sides to 32 bits so a change from 16- to 20/24-bit
+    # samples cannot be hidden by converting both sides down to 16 bits.
+    codec = "pcm_s32le"
+    raw_format = "s32le"
+
+    def update_samples(hasher, input_args, index):
+        read_fd, write_fd = os.pipe()
+        with tempfile.TemporaryFile(mode="w+") as errors:
+            command = [FFMPEG, "-nostdin", "-v", "error", "-xerror", *input_args[:-1],
+                       "-i", input_args[-1], "-map", f"0:{index}", "-c:a", codec,
+                       "-f", raw_format, f"pipe:{write_fd}"]
+            try:
+                process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=errors,
+                                           pass_fds=(write_fd,))
+            except Exception:
+                os.close(read_fd)
+                os.close(write_fd)
+                raise
+            os.close(write_fd)
+            total = 0
+            try:
+                with os.fdopen(read_fd, "rb") as samples:
+                    for block in iter(lambda: samples.read(1024 * 1024), b""):
+                        hasher.update(block)
+                        total += len(block)
+                if process.wait():
+                    errors.seek(0)
+                    raise SourceComparisonError(f"DVD LPCM decoding failed: {errors.read().strip()}")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                process.wait()
+            return total
+
+    before, after = hashlib.sha256(), hashlib.sha256()
+    input_bytes = sum(update_samples(before, dvd_input(source, opts), source_index) for opts in options_list)
+    output_bytes = update_samples(after, [str(output)], output_index)
+    if not input_bytes:
+        raise SourceComparisonError(f"PCM stream {source_index}: source produced no samples")
+    if input_bytes != output_bytes or before.digest() != after.digest():
+        raise SourceComparisonError(f"PCM stream {source_index}: decoded samples differ from source")
+    return input_bytes
+
+
+def compare_pcm_timing(source, options_list, output, source_index, output_index, sample_rate,
+                       offsets, chapters, sample_fmt, channels):
+    try:
+        rate = int(sample_rate)
+        if rate <= 0:
+            raise ValueError()
+    except (TypeError, ValueError) as exc:
+        raise SourceComparisonError(f"PCM stream {source_index}: invalid sample rate") from exc
+
+    def frame_samples(frame, label, tolerance):
+        try:
+            count = int(frame["nb_samples"])
+            frame_channels = int(frame["channels"])
+        except (KeyError, ValueError) as exc:
+            raise SourceComparisonError(f"{label} lacks a sample or channel count") from exc
+        duration = timestamp(frame, "duration_time")
+        if (count <= 0 or frame_channels != channels or frame.get("sample_fmt") != sample_fmt
+                or duration is None or abs(duration - count / rate) > tolerance):
+            raise SourceComparisonError(f"{label} has an unsupported PCM format or sample rate change")
+        return count
+
+    with probe_records(frame_command([str(output)], output_index), "pts_time=") as output_frames:
+        current = None
+        output_used = 0
+        for chapter, options in zip(chapters, options_list):
+            with probe_records(frame_command(dvd_input(source, options), source_index), "pts_time=") as source_frames:
+                for original in source_frames:
+                    source_pts = timestamp(original, "pts_time")
+                    source_samples = frame_samples(original, "DVD PCM frame", 0.0001)
+                    if source_pts is None:
+                        raise SourceComparisonError("DVD PCM frame lacks usable timing")
+                    source_used = 0
+                    while source_used < source_samples:
+                        if current is None:
+                            current = next(output_frames, None)
+                            output_used = 0
+                            if current is None:
+                                raise SourceComparisonError("PCM output ended before the source")
+                        output_pts = timestamp(current, "pts_time")
+                        output_samples = frame_samples(current, "PCM output frame", 0.0011)
+                        if output_pts is None:
+                            raise SourceComparisonError("PCM output frame lacks usable timing")
+                        source_time = source_pts + offsets[chapter] + source_used / rate
+                        output_time = output_pts + output_used / rate
+                        if abs(source_time - output_time) > 0.003:
+                            raise SourceComparisonError(f"PCM stream {source_index}: sample timing differs from source")
+                        matched = min(source_samples - source_used, output_samples - output_used)
+                        source_used += matched
+                        output_used += matched
+                        if output_used == output_samples:
+                            current = None
+        if current is not None or next(output_frames, None) is not None:
+            raise SourceComparisonError("PCM output has extra decoded samples")
+
+
+def compare_dvd_media(source, options, output, title=None, chapters=False):
+    input_args = ["-f", "dvdvideo", *options]
+    source_streams = probe_dvd_streams(source, input_args)
+    observed = probe(output)
+    output_streams = observed["streams"]
+    if len(source_streams) != len(output_streams):
+        raise SourceComparisonError("DVD and MKV stream counts differ")
+    indexes = [stream.get("index") for stream in source_streams]
+    if any(not isinstance(index, int) for index in indexes) or len(set(indexes)) != len(indexes):
+        raise SourceComparisonError("DVD source stream indexes are missing or ambiguous")
+    for original, actual in zip(source_streams, output_streams):
+        if not isinstance(actual.get("index"), int):
+            raise SourceComparisonError("MKV stream index is missing")
+        codec = original.get("codec_name")
+        expected_codec = ("pcm_s16le" if original.get("sample_fmt") == "s16" else "pcm_s24le") if codec == "pcm_dvd" else codec
+        if actual.get("codec_name") != expected_codec or original.get("codec_type") != actual.get("codec_type"):
+            raise SourceComparisonError(f"DVD stream {original['index']} does not match MKV stream {actual['index']}")
+        if codec == "pcm_dvd" and (str(original.get("sample_rate")) != str(actual.get("sample_rate"))
+                                    or original.get("channels") != actual.get("channels")):
+            raise SourceComparisonError(f"DVD PCM stream {original['index']} format differs from MKV")
+    videos = [(original, actual) for original, actual in zip(source_streams, output_streams)
+              if original.get("codec_type") == "video"]
+    if len(videos) != 1:
+        raise SourceComparisonError("Source comparison requires one identifiable video stream")
+
+    chapter_numbers = list(range(1, len(title[2]) + 1)) if chapters and title else [None]
+    durations = ({number: title[2][number - 1] for number in chapter_numbers}
+                 if chapters else {None: title[1]} if title else {})
+    offsets = {}
+    comparison = {"verified": True, "method": "chapters" if chapters else "whole", "streams": []}
+    original, actual = videos[0]
+    counts = compare_packet_stream(source, options, output, original["index"], actual["index"],
+                                   chapter_numbers, offsets, durations, "video")
+    if chapters:
+        starts = observed["chapter_starts"]
+        if len(starts) != len(chapter_numbers) or any(
+                not math.isfinite(start) or abs(offsets[number] - start) > 0.15
+                for number, start in zip(chapter_numbers, starts)):
+            raise SourceComparisonError("Chapter timestamps do not match the source video")
+    comparison["streams"].append({"index": actual["index"], "method": "packet_sha256", "packets": sum(counts)})
+    for original, actual in zip(source_streams, output_streams):
+        kind = original.get("codec_type")
+        if kind == "video":
+            continue
+        if kind not in ("audio", "subtitle"):
+            raise SourceComparisonError(f"Unsupported source stream type: {kind}")
+        if original.get("codec_name") == "pcm_dvd":
+            options_list = []
+            for chapter in chapter_numbers:
+                chapter_options = list(options)
+                if chapter is not None:
+                    chapter_options.extend(["-chapter_start", str(chapter), "-chapter_end", str(chapter)])
+                options_list.append(chapter_options)
+            count = pcm_hash(source, options_list, output, original["index"], actual["index"], original.get("sample_fmt"))
+            compare_pcm_timing(source, options_list, output, original["index"], actual["index"],
+                               original.get("sample_rate"), offsets, chapter_numbers,
+                               original.get("sample_fmt"), original.get("channels"))
+            comparison["streams"].append({"index": actual["index"], "method": "decoded_pcm_sha256", "bytes": count})
+        else:
+            counts = compare_packet_stream(source, options, output, original["index"], actual["index"],
+                                           chapter_numbers, offsets, {}, kind)
+            comparison["streams"].append({"index": actual["index"], "method": "packet_sha256", "packets": sum(counts)})
+    return comparison
+
+
+def compare_dvd(source, options, output, title=None):
+    try:
+        return compare_dvd_media(source, options, output, title)
+    except SourceComparisonError as whole_error:
+        if not title or len(title[2]) <= 1:
+            raise
+        try:
+            return compare_dvd_media(source, options, output, title, chapters=True)
+        except SourceComparisonError as chapter_error:
+            raise SourceComparisonError(
+                f"Whole-title comparison failed: {whole_error}; chapter comparison failed: {chapter_error}"
+            ) from chapter_error
+
+
 def extract(source, out, kind):
     identity = source_identity(source)
     expected = inventory(source, kind)
@@ -574,22 +902,23 @@ def extract(source, out, kind):
                     print(f"Title {title[0]} is an interactive still gallery. Export it with:\n"
                           f"  {gallery_command(source, destination, title[0])}")
                 continue
+            options = ["-title", str(title[0]), "-trim", "0", "-preindex", "1"] if title else item
             receipt = matching_receipt(path, identity)
-            if receipt is not None:
+            if receipt is not None and receipt.get("status") != "incomplete":
                 check = None
                 try:
                     if title:
                         check = completeness(title, probe(path))
-                except ValueError as exc:
-                    check = {"error": str(exc)}
-                if check is not None:
-                    if "error" in check or receipt.get("status") != "incomplete":
-                        if receipt.get("version") == 1 or any(receipt.get(k) != v for k, v in check.items()):
-                            write_receipt(path, identity, receipt["sha256"], check)
-                if receipt.get("status") != "incomplete" and (check is None or "error" not in check):
-                    print(f"Completed extraction matches source and checksum; skipping {path}")
+                        if "error" in check:
+                            raise SourceComparisonError(check["error"])
+                    comparison = compare_dvd(source, options, path, title)
+                    write_receipt(path, identity, receipt["sha256"], check, comparison)
+                    print(f"Source comparison passed; skipping {path}")
                     continue
-            options = ["-title", str(title[0]), "-trim", "0", "-preindex", "1"] if title else item
+                except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+                    comparison = {"verified": False, "error": str(exc)}
+                    write_receipt(path, identity, receipt["sha256"], check, comparison)
+                    print(f"{path}: {exc}; re-extracting", file=sys.stderr)
             temp_fd, temp_name = tempfile.mkstemp(prefix=f".{name}.", suffix=".part", dir=out)
             os.close(temp_fd)
             temporary = Path(temp_name)
@@ -603,12 +932,13 @@ def extract(source, out, kind):
                     check = completeness(title, probe(temporary))
                 if check and "error" in check:
                     raise ValueError(f"{name}: {check['error']}")
+                comparison = compare_dvd(source, options, temporary, title)
                 checksum = digest(temporary)
                 with temporary.open("rb") as handle:
                     os.fsync(handle.fileno())
                 receipt_path(path).unlink(missing_ok=True)
                 os.replace(temporary, path)
-                write_receipt(path, identity, checksum, check)
+                write_receipt(path, identity, checksum, check, comparison)
             finally:
                 temporary.unlink(missing_ok=True)
     finally:
@@ -662,14 +992,22 @@ def verify(source, root):
                     raise ValueError("Missing or invalid completion receipt, source mismatch, or checksum mismatch; re-extract")
                 entry.update(probe(path))
                 entry["sha256"] = receipt["sha256"]
-                if kind == "title":
-                    check = completeness(item, entry)
-                    entry.update(check)
-                    if "error" in check:
-                        write_receipt(path, identity, entry["sha256"], check)
-                        raise ValueError(check["error"])
-                if receipt.get("status") == "incomplete":
-                    raise ValueError(receipt.get("error", "Incomplete receipt; re-extract"))
+                title = item if kind == "title" else None
+                options = ["-title", str(title[0]), "-trim", "0", "-preindex", "1"] if title else item
+                check = completeness(title, entry) if title else None
+                try:
+                    if check:
+                        entry.update(check)
+                        if "error" in check:
+                            raise SourceComparisonError(check["error"])
+                    comparison = compare_dvd(source, options, path, title)
+                except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+                    comparison = {"verified": False, "error": str(exc)}
+                    entry["source_comparison"] = comparison
+                    write_receipt(path, identity, receipt["sha256"], check, comparison)
+                    raise
+                entry["source_comparison"] = comparison
+                write_receipt(path, identity, receipt["sha256"], check, comparison)
             finally:
                 os.close(fd)
         except (OSError, ValueError) as exc:

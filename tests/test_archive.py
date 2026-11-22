@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 import importlib.machinery
 import contextlib
+import wave
 import io
 import importlib.util
 import json
@@ -31,6 +32,11 @@ class ArchiveTests(unittest.TestCase):
         galleries = patch.object(archive, "confirmed_galleries", return_value={})
         self.galleries = galleries.start()
         self.addCleanup(galleries.stop)
+        self.real_compare_dvd = archive.compare_dvd
+        comparison = patch.object(archive, "compare_dvd", return_value={
+            "verified": True, "method": "whole", "streams": []})
+        self.comparison = comparison.start()
+        self.addCleanup(comparison.stop)
         self.calls = []
         self.options = {'title_001.mkv': (1, 10.0, [10.0])}
         self.media = {'verified': True, 'duration': 10.0, 'chapter_count': 0}
@@ -214,7 +220,7 @@ class ArchiveTests(unittest.TestCase):
         with patch.object(archive, 'inventory', return_value=self.options), \
              patch.object(archive, 'remux_dvd'), \
              patch.object(archive, 'probe', side_effect=[
-                 self.media, self.media, {'duration': 60.0, 'chapter_count': 2}]), \
+                 self.media, {'duration': 60.0, 'chapter_count': 2}]), \
              patch.object(archive, 'recover_chapters') as recover:
             archive.extract(self.source, self.titles, 'title')
         recover.assert_called_once()
@@ -300,6 +306,180 @@ class ArchiveTests(unittest.TestCase):
         (path / entry['image']).unlink()
         with self.assertRaises(FileNotFoundError):
             archive.verify_gallery(path, identity, 1, graph)
+
+    def test_comparison_failure_marks_receipt_and_preserves_existing_file(self):
+        self.extract()
+        path = self.titles / 'title_001.mkv'
+        original = path.read_bytes()
+        self.comparison.side_effect = archive.SourceComparisonError("packet content differs")
+        status, manifest = self.verify()
+        entry = next(e for e in manifest['files'] if e['kind'] == 'title')
+        self.assertEqual(status, 1)
+        self.assertFalse(entry['verified'])
+        self.assertIn("packet content differs", entry['source_comparison']['error'])
+        receipt = json.loads(archive.receipt_path(path).read_text())
+        self.assertEqual(receipt['status'], 'incomplete')
+        self.assertFalse(receipt['source_comparison']['verified'])
+        with self.assertRaisesRegex(archive.SourceComparisonError, "packet content differs"):
+            self.extract()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(json.loads(archive.receipt_path(path).read_text())['status'], 'incomplete')
+
+    def test_missing_packet_and_incomplete_source_are_rejected(self):
+        def packet(pts, digest):
+            return {"pts_time": str(pts), "dts_time": str(pts),
+                    "duration_time": "1", "data_hash": digest}
+        source_packets = [packet(0, "a"), packet(1, "b")]
+        output_packets = [packet(0, "a")]
+
+        @contextlib.contextmanager
+        def records(command, prefix):
+            yield iter(source_packets if command[-1] == str(self.source) else output_packets)
+
+        with patch.object(archive, 'probe_records', side_effect=records):
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'output ended early'):
+                archive.compare_packet_stream(self.source, ['-title', '1'], self.root / 'out.mkv',
+                                              0, 0, [None], {}, {None: 2}, 'video')
+            output_packets.append(packet(1, "changed"))
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'packet content differs'):
+                archive.compare_packet_stream(self.source, ['-title', '1'], self.root / 'out.mkv',
+                                              0, 0, [None], {}, {None: 2}, 'video')
+            output_packets[-1] = packet(1, "b")
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'ended early'):
+                archive.compare_packet_stream(self.source, ['-title', '1'], self.root / 'out.mkv',
+                                              0, 0, [None], {}, {None: 10}, 'video')
+            output_packets[-1]["pts_time"] = "1.1"
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'pts_time differs'):
+                archive.compare_packet_stream(self.source, ['-title', '1'], self.root / 'out.mkv',
+                                              0, 0, [None], {}, {None: 2}, 'video')
+            output_packets[-1] = packet(1, "b")
+            source_packets[-1]["flags"] = "K_C"
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'packet is corrupt'):
+                archive.compare_packet_stream(self.source, ['-title', '1'], self.root / 'out.mkv',
+                                              0, 0, [None], {}, {None: 2}, 'video')
+
+    def test_menu_comparison_upgrades_legacy_receipt(self):
+        self.extract()
+        menu = self.out / 'menus' / 'vts_000_lu_001_pgc_001.mkv'
+        menu.parent.mkdir()
+        menu.write_bytes(b'menu')
+        archive.write_receipt(menu, archive.source_identity(self.source), archive.digest(menu))
+        status, manifest = self.verify()
+        entry = next(item for item in manifest['files'] if item['kind'] == 'menu')
+        self.assertEqual(status, 0)
+        self.assertTrue(entry['source_comparison']['verified'])
+        receipt = json.loads(archive.receipt_path(menu).read_text())
+        self.assertEqual(receipt['version'], 3)
+        self.assertTrue(receipt['source_comparison']['verified'])
+
+    def test_chapter_read_comparison_when_whole_title_stops(self):
+        video = {"index": 0, "codec_type": "video", "codec_name": "mpeg2video"}
+        output = self.root / 'out.mkv'
+        media = {"streams": [video], "chapter_starts": [0, 1]}
+        title = (1, 2.0, [1.0, 1.0])
+
+        def packet(pts, digest):
+            return {"pts_time": str(pts), "dts_time": str(pts),
+                    "duration_time": "1", "data_hash": digest}
+
+        @contextlib.contextmanager
+        def records(command, prefix):
+            if command[-1] == str(output):
+                data = [packet(0, "a"), packet(1, "b")]
+            elif "-chapter_start" in command:
+                chapter = int(command[command.index("-chapter_start") + 1])
+                data = [packet(0, "a" if chapter == 1 else "b")]
+            else:
+                data = [packet(0, "a")]
+            yield iter(data)
+
+        with patch.object(archive, 'probe_dvd_streams', return_value=[video]), \
+             patch.object(archive, 'probe', return_value=media), \
+             patch.object(archive, 'probe_records', side_effect=records):
+            result = self.real_compare_dvd(self.source, ['-title', '1'], output, title)
+        self.assertEqual(result['method'], 'chapters')
+        self.assertEqual(result['streams'][0]['packets'], 2)
+
+    def test_pcm_comparison_matches_samples_despite_repacketization(self):
+        ffmpeg = Path(archive.FFMPEG)
+        if not ffmpeg.is_file():
+            self.skipTest("DVD-enabled FFmpeg is required")
+        original = self.root / 'original.wav'
+        output = self.root / 'output.wav'
+        samples = bytes(range(256)) * 40
+        for path in (original, output):
+            with wave.open(str(path), 'wb') as audio:
+                audio.setnchannels(2)
+                audio.setsampwidth(2)
+                audio.setframerate(48000)
+                audio.writeframes(samples)
+        with patch.object(archive, 'dvd_input', return_value=[str(original)]):
+            self.assertEqual(archive.pcm_hash(original, [[]], output, 0, 0, 's16'), len(samples) * 2)
+        with wave.open(str(output), 'wb') as audio:
+            audio.setnchannels(2)
+            audio.setsampwidth(2)
+            audio.setframerate(48000)
+            audio.writeframes(bytes(reversed(samples)))
+        with patch.object(archive, 'dvd_input', return_value=[str(original)]):
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'samples differ'):
+                archive.pcm_hash(original, [[]], output, 0, 0, 's16')
+
+    def test_pcm_frame_timing_can_cross_different_packet_boundaries(self):
+        source_frames = [{"pts_time": str(n / 2), "duration_time": "0.5",
+                          "nb_samples": "2", "sample_fmt": "s16", "channels": "2"}
+                         for n in range(2)]
+        output_frames = [{"pts_time": str(n / 4), "duration_time": "0.25",
+                          "nb_samples": "1", "sample_fmt": "s16", "channels": "2"}
+                         for n in range(4)]
+
+        @contextlib.contextmanager
+        def records(command, prefix):
+            yield iter(source_frames if command[-1] == str(self.source) else output_frames)
+
+        with patch.object(archive, 'probe_records', side_effect=records):
+            archive.compare_pcm_timing(self.source, [[]], self.root / 'output.mkv', 1, 1, 4,
+                                       {None: 0}, [None], "s16", 2)
+            output_frames[2]["pts_time"] = "0.6"
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'timing differs'):
+                archive.compare_pcm_timing(self.source, [[]], self.root / 'output.mkv', 1, 1, 4,
+                                           {None: 0}, [None], "s16", 2)
+            output_frames[2]["pts_time"] = "0.5"
+            source_frames[1]["sample_fmt"] = "s32"
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'format or sample rate change'):
+                archive.compare_pcm_timing(self.source, [[]], self.root / 'output.mkv', 1, 1, 4,
+                                           {None: 0}, [None], "s16", 2)
+
+    def test_24_bit_pcm_comparison_normalizes_samples(self):
+        if not Path(archive.FFMPEG).is_file():
+            self.skipTest("DVD-enabled FFmpeg is required")
+        original = self.root / 'original24.wav'
+        output = self.root / 'output24.wav'
+        samples = bytes(range(240)) * 20
+        for path in (original, output):
+            with wave.open(str(path), 'wb') as audio:
+                audio.setnchannels(2)
+                audio.setsampwidth(3)
+                audio.setframerate(48000)
+                audio.writeframes(samples)
+        with patch.object(archive, 'dvd_input', return_value=[str(original)]):
+            self.assertEqual(archive.pcm_hash(original, [[]], output, 0, 0, 's32'), len(samples) * 4 // 3)
+
+    def test_pcm_comparison_detects_lost_low_bits(self):
+        if not Path(archive.FFMPEG).is_file():
+            self.skipTest("DVD-enabled FFmpeg is required")
+        original = self.root / 'source24.wav'
+        output = self.root / 'output16.wav'
+        for path, width, samples in (
+                (original, 3, b"\x01\x00\x10" * 100),
+                (output, 2, b"\x00\x10" * 100)):
+            with wave.open(str(path), 'wb') as audio:
+                audio.setnchannels(1)
+                audio.setsampwidth(width)
+                audio.setframerate(48000)
+                audio.writeframes(samples)
+        with patch.object(archive, 'dvd_input', return_value=[str(original)]):
+            with self.assertRaisesRegex(archive.SourceComparisonError, 'samples differ'):
+                archive.pcm_hash(original, [[]], output, 0, 0, 's16')
 
     def test_directory_fingerprint_tracks_dvd_content_only(self):
         dvd = self.root / 'folder'
