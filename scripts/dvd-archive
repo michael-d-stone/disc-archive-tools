@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Michael Stone
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Shared DVD extraction implementation; also installed alongside the commands."""
+import argparse
 import fcntl
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -48,6 +49,45 @@ def source_identity(source):
     return {"type": "directory", "files": [
         {"file": p.name, "sha256": digest(p)} for p in files
     ]}
+
+
+
+def output_prefix(source, override=None):
+    name = override if override is not None else (source.stem if source.is_file() else source.name)
+    if override is None and name.upper() in {"VIDEO_TS", "BDMV"}:
+        name = source.parent.name
+    name = re.sub(r"\s+", "_", name.lower())
+    name = re.sub(r"[^a-z0-9_]", "", name)
+    name = re.sub(r"_+", "_", name).strip("_")
+    if not name:
+        raise ValueError("Source name has no usable characters; specify --name")
+    return name
+
+
+def archive_prefix(titles, source, override=None, create=False, kind="title"):
+    """Keep one naming scheme for an archive, including partially completed runs."""
+    config = titles / ".disc-archive-naming.json"
+    if config.exists():
+        record = json.loads(config.read_text(encoding="utf-8"))
+        if record.get("version") != 1 or not isinstance(record.get("prefix"), str):
+            raise ValueError(f"Invalid naming configuration: {config}")
+        prefix = record["prefix"]
+        if override is not None and output_prefix(source, override) != prefix:
+            raise ValueError("--name does not match this archive's existing naming scheme")
+        return prefix
+    legacy = any(titles.glob(f"{kind}_[0-9]*.mkv*"))
+    if legacy and override is not None:
+        raise ValueError("Cannot change the naming scheme of an existing archive")
+    prefix = "" if legacy else output_prefix(source, override)
+    if create:
+        titles.mkdir(parents=True, exist_ok=True)
+        atomic_json(config, {"version": 1, "prefix": prefix})
+    return prefix
+
+
+def prefixed_name(name, prefix):
+    return f"{prefix}_{name}" if prefix else name
+
 
 
 def run(command):
@@ -992,9 +1032,11 @@ def compare_dvd(source, options, output, title=None):
             ) from chapter_error
 
 
-def extract(source, out, kind):
+def extract(source, out, kind, prefix=""):
     identity = source_identity(source)
     expected = inventory(source, kind)
+    if kind == "title":
+        expected = {prefixed_name(name, prefix): item for name, item in expected.items()}
     galleries = confirmed_galleries(source) if kind == "title" else {}
     out.mkdir(parents=True, exist_ok=True)
     fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY)
@@ -1068,7 +1110,7 @@ def extract(source, out, kind):
         os.close(fd)
 
 
-def verify(source, root):
+def verify(source, root, prefix=""):
     if not root.is_dir():
         raise ValueError(f"Not a directory: {root}")
     identity = source_identity(source)
@@ -1076,12 +1118,12 @@ def verify(source, root):
     trace_cache = {}
     expected = {}
     for kind, directory in (("title", "titles"), ("menu", "menus")):
-        expected.update({f"{directory}/{name}": (kind, item)
+        expected.update({f"{directory}/{prefixed_name(name, prefix) if kind == 'title' else name}": (kind, item)
                          for name, item in inventory(source, kind).items()})
     actual = {str(p.relative_to(root)) for directory in ("titles", "menus")
               for p in (root / directory).glob("*.mkv")}
     for number in galleries:
-        mkv = f"titles/title_{number:03d}.mkv"
+        mkv = f"titles/{prefixed_name(f'title_{number:03d}.mkv', prefix)}"
         expected.pop(mkv, None)
         actual.discard(mkv)
         index = gallery_destination(root, number) / "index.html"
@@ -1169,15 +1211,28 @@ def main(mode=None):
         except (OSError, ValueError, subprocess.CalledProcessError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-    if mode not in {"title", "menu", "verify"} or len(args) not in ({2} if mode == "verify" else {1, 2}):
-        print("Usage: <command> <dvd.iso|dvd-directory> [output-directory]", file=sys.stderr)
+    if mode not in {"title", "menu", "verify"}:
+        print("Unknown DVD command", file=sys.stderr)
         return 1
-    source = Path(args[0]).resolve()
-    out = Path(args[1] if len(args) == 2 else {"title": "titles", "menu": "menus"}[mode]).resolve()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", help="disc name used as the filename prefix")
+    parser.add_argument("source")
+    parser.add_argument("output", nargs="?" if mode != "verify" else None,
+                        default={"title": "titles", "menu": "menus", "verify": None}[mode])
+    parsed = parser.parse_args(args)
+    source = Path(parsed.source).resolve()
+    out = Path(parsed.output).resolve()
     try:
-        if mode == "verify":
-            return verify(source, out)
-        extract(source, out, mode)
+        if mode == "menu":
+            if parsed.name is not None:
+                raise ValueError("--name applies to title extraction, not menus")
+            extract(source, out, mode)
+        elif mode == "verify":
+            prefix = archive_prefix(out / "titles", source, parsed.name)
+            return verify(source, out, prefix)
+        else:
+            prefix = archive_prefix(out, source, parsed.name, create=True)
+            extract(source, out, mode, prefix)
         return 0
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

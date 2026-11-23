@@ -129,6 +129,27 @@ is not yet implemented. Verification checks metadata, timestamps, and
 checksums. It does not compare every output packet with the source or perform
 a full decode.
 
+### Disc names in filenames
+
+New DVD titles and Blu-ray playlists use the source folder or ISO filename as a
+prefix, for example `home_alone_disc_1_title_001.mkv` or
+`home_alone_disc_1_playlist_00001.mkv`. Names are lowercased, whitespace becomes
+underscores, punctuation is removed, and repeated underscores are collapsed.
+For `VIDEO_TS` or `BDMV` directories, the parent folder supplies the name.
+Use `--name` to choose a different name on the first extraction:
+
+```bash
+dvd-extract --name "Home Alone Disc 1" /path/to/disc.iso /path/to/output
+bluray-extract --name "Home Alone Disc 1" /path/to/disc.iso /path/to/output
+```
+
+The same option is available on the title-only extractors. The chosen name is
+stored in `titles/.disc-archive-naming.json` so verification and resumed runs
+use the same names even if the source is moved. Existing archives using
+unprefixed names keep those names; files are not renamed automatically. Menu
+and gallery names are unchanged. An override must match the archive's existing
+naming choice. If normalization leaves no usable characters, supply `--name`.
+
 ## DVD-Video usage
 
 Extract an already-readable DVD ISO:
@@ -254,9 +275,9 @@ A DVD-Video extraction has this layout:
 ```text
 output/
 ├── titles/
-│   ├── title_001.mkv
-│   ├── title_001.mkv.receipt.json
-│   ├── title_002.mkv
+│   ├── disc_title_001.mkv
+│   ├── disc_title_001.mkv.receipt.json
+│   ├── disc_title_002.mkv
 │   └── ...
 ├── menus/
 │   ├── vts_001_lu_001_pgc_001.mkv

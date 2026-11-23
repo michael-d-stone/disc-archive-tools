@@ -66,6 +66,15 @@ class BluRayTests(unittest.TestCase):
             _, report = self.verify({1: self.playlist})
             self.assertEqual(report["summary"]["failed"], 2)
 
+    def test_prefixed_playlist_extraction_verifies_and_resumes(self):
+        with patch.dict(globals_, {"probe": lambda path: self.media, "check_packet_timestamps": lambda path: None}), \
+             patch.object(subprocess, "run", side_effect=self.ffmpeg) as ffmpeg:
+            self.assertEqual(extract(self.source, self.out, self.identity, {1: self.playlist}, "home_alone"), 0)
+            self.assertEqual(extract(self.source, self.out, self.identity, {1: self.playlist}, "home_alone"), 0)
+            self.assertEqual(ffmpeg.call_count, 1)
+            self.assertEqual(verify(self.source, self.out, self.identity, {1: self.playlist}, {}, "home_alone"), 0)
+        self.assertTrue((self.out / "titles/home_alone_playlist_00001.mkv.receipt.json").exists())
+
     def test_incomplete_media_and_wrong_source_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "Duration mismatch"):
             completeness(self.playlist, dict(self.media, format={"duration": "1"}))

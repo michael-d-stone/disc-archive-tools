@@ -4,6 +4,11 @@ DVD-Video reliability and Blu-ray development can proceed in parallel. Each
 track has its own completion criteria. Coordinate changes that affect both
 tracks, especially receipt and manifest behavior.
 
+## Disc filenames — implemented
+
+DVD titles and Blu-ray playlists use a normalized source-name prefix, with a
+manual override and compatibility for existing unprefixed archives.
+
 ## DVD-Video reliability
 
 ### Archive rechecks — complete

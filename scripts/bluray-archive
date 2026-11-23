@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Michael Stone
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Extract and verify authored Blu-ray playlists."""
+import argparse
 import fcntl
 from contextlib import ExitStack
 from itertools import zip_longest
@@ -22,6 +23,8 @@ FFPROBE = dvd["FFPROBE"]
 digest = dvd["digest"]
 atomic_json = dvd["atomic_json"]
 publish_manifest = dvd["publish_manifest"]
+archive_prefix = dvd["archive_prefix"]
+prefixed_name = dvd["prefixed_name"]
 
 CODECS = {
     0x01: "mpeg1video", 0x02: "mpeg2video", 0x1b: "h264", 0x24: "hevc", 0xea: "vc1",
@@ -295,7 +298,7 @@ def compare_boundary_packets(source, number, output, streams, correction):
     return counts
 
 
-def extract(source, root, identity, playlists):
+def extract(source, root, identity, playlists, prefix=""):
     titles = root / "titles"
     logs = root / "logs"
     titles.mkdir(parents=True, exist_ok=True)
@@ -305,7 +308,7 @@ def extract(source, root, identity, playlists):
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for number, playlist in sorted(playlists.items()):
-            name = f"playlist_{number:05d}.mkv"
+            name = prefixed_name(f"playlist_{number:05d}.mkv", prefix)
             path = titles / name
             log = logs / f"playlist_{number:05d}.log"
             try:
@@ -420,30 +423,30 @@ def extract(source, root, identity, playlists):
     return failures
 
 
-def verify(source, root, identity, playlists, menus):
+def verify(source, root, identity, playlists, menus, prefix=""):
     titles = root / "titles"
     if not titles.is_dir():
-        return verify_locked(source, root, identity, playlists, menus)
+        return verify_locked(source, root, identity, playlists, menus, prefix)
     fd = os.open(titles, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return verify_locked(source, root, identity, playlists, menus)
+        return verify_locked(source, root, identity, playlists, menus, prefix)
     finally:
         os.close(fd)
 
 
-def verify_locked(source, root, identity, playlists, menus):
+def verify_locked(source, root, identity, playlists, menus, prefix=""):
     entries = []
     titles = root / "titles"
     actual = {p.name for p in titles.glob("*.mkv")} if titles.is_dir() else set()
-    expected = {f"playlist_{n:05d}.mkv" for n in playlists}
-    for name in sorted(expected | actual):
+    expected = {prefixed_name(f"playlist_{n:05d}.mkv", prefix): n for n in playlists}
+    for name in sorted(set(expected) | actual):
         path = titles / name
         entry = {"file": f"titles/{name}", "verified": False}
         try:
             if name not in expected:
                 raise ValueError("Unexpected file: absent from source inventory")
-            number = int(name[9:14])
+            number = expected[name]
             playlist = playlists[number]
             entry.update({"playlist": number, "expected": playlist,
                           "log": f"logs/playlist_{number:05d}.log"})
@@ -489,15 +492,16 @@ def verify_locked(source, root, identity, playlists, menus):
 
 
 def main(mode):
-    args = sys.argv[1:]
-    if len(args) not in ({2} if mode == "verify" else {1, 2}):
-        print(f"Usage: bluray-{mode} SOURCE {'OUTPUT' if mode == 'verify' else '[OUTPUT]'}", file=sys.stderr)
-        return 1
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", help="disc name used as the filename prefix")
+    parser.add_argument("source")
+    parser.add_argument("output", nargs="?" if mode != "verify" else None, default="bluray-extract")
+    parsed = parser.parse_args()
     try:
-        print(f"Fingerprinting source: {args[0]}", flush=True)
-        source, identity = source_details(Path(args[0]))
+        print(f"Fingerprinting source: {parsed.source}", flush=True)
+        source, identity = source_details(Path(parsed.source))
         playlists, menus = inventory(source)
-        out = Path(args[1] if len(args) == 2 else "bluray-extract").resolve()
+        out = Path(parsed.output).resolve()
         if mode == "verify" and not out.is_dir():
             raise ValueError(f"Not a directory: {out}")
         if source.is_dir():
@@ -506,11 +510,13 @@ def main(mode):
                 raise ValueError("Output must be outside the source BDMV directory")
         out.mkdir(parents=True, exist_ok=True)
         print(f"Discovered {len(playlists)} playlists. Blu-ray menu preservation is not yet supported.", flush=True)
+        prefix = archive_prefix(out / "titles", Path(parsed.source).resolve(), parsed.name,
+                                create=mode != "verify", kind="playlist")
         if mode == "verify":
-            return verify(source, out, identity, playlists, menus)
-        failures = extract(source, out, identity, playlists)
+            return verify(source, out, identity, playlists, menus, prefix)
+        failures = extract(source, out, identity, playlists, prefix)
         if mode == "extract":
-            failures += verify(source, out, identity, playlists, menus)
+            failures += verify(source, out, identity, playlists, menus, prefix)
         return int(bool(failures))
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

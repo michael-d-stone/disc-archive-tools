@@ -53,6 +53,43 @@ class ArchiveTests(unittest.TestCase):
              patch.object(archive, 'probe', return_value=self.media):
             archive.extract(self.source, self.titles, 'title')
 
+    def test_prefix_normalization_and_persistent_legacy_choice(self):
+        iso = self.root / 'Home Alone:  Disc 1.ISO'
+        iso.touch()
+        self.assertEqual(archive.output_prefix(iso), 'home_alone_disc_1')
+        disc = self.root / 'Smokey and the Bandit'
+        (disc / 'VIDEO_TS').mkdir(parents=True)
+        self.assertEqual(archive.output_prefix(disc / 'VIDEO_TS'), 'smokey_and_the_bandit')
+        self.assertEqual(archive.output_prefix(iso, 'The Getaway: Disc 2'), 'the_getaway_disc_2')
+        with self.assertRaisesRegex(ValueError, '--name'):
+            archive.output_prefix(iso, ':::')
+        self.assertEqual(archive.archive_prefix(self.titles, iso, create=True), 'home_alone_disc_1')
+        self.assertEqual(archive.archive_prefix(self.titles, self.source), 'home_alone_disc_1')
+        with self.assertRaisesRegex(ValueError, 'does not match'):
+            archive.archive_prefix(self.titles, iso, 'different')
+        legacy = self.root / 'legacy'
+        legacy.mkdir()
+        (legacy / 'title_001.mkv').touch()
+        self.assertEqual(archive.archive_prefix(legacy, iso, create=True), '')
+        (legacy / 'title_001.mkv').unlink()
+        self.assertEqual(archive.archive_prefix(legacy, iso), '')
+
+    def test_prefixed_dvd_extraction_verifies_and_resumes(self):
+        with patch.object(archive, 'inventory', return_value=self.options), \
+             patch.object(archive, 'probe_dvd_streams', return_value=[]), \
+             patch.object(archive.subprocess, 'run', side_effect=self.fake_ffmpeg), \
+             patch.object(archive, 'probe', return_value=self.media):
+            archive.extract(self.source, self.titles, 'title', 'home_alone')
+            archive.extract(self.source, self.titles, 'title', 'home_alone')
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue((self.titles / 'home_alone_title_001.mkv.receipt.json').exists())
+        output = io.StringIO()
+        with patch.object(archive, 'inventory', side_effect=lambda source, kind: self.options if kind == 'title' else {}), \
+             patch.object(archive, 'probe', return_value=self.media), contextlib.redirect_stdout(output):
+            self.assertEqual(archive.verify(self.source, self.out, 'home_alone'), 0)
+        report = json.loads(Path(output.getvalue().strip().removeprefix('Verification result: ')).read_text())
+        self.assertEqual(report['files'][0]['file'], 'titles/home_alone_title_001.mkv')
+
     def test_only_dvd_pcm_streams_use_lossless_pcm_conversion(self):
         streams = [
             {"index": 0, "codec_name": "mpeg2video"},
