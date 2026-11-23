@@ -90,6 +90,39 @@ class ArchiveTests(unittest.TestCase):
         report = json.loads(Path(output.getvalue().strip().removeprefix('Verification result: ')).read_text())
         self.assertEqual(report['files'][0]['file'], 'titles/home_alone_title_001.mkv')
 
+    def test_prefixed_menu_extraction_verifies_and_resumes(self):
+        menus = self.out / 'menus'
+        inventory = {'vts_000_lu_001_pgc_001.mkv': []}
+        with patch.object(archive, 'inventory', return_value=inventory), \
+             patch.object(archive, 'probe_dvd_streams', return_value=[]), \
+             patch.object(archive.subprocess, 'run', side_effect=self.fake_ffmpeg), \
+             patch.object(archive, 'probe', return_value=self.media):
+            archive.extract(self.source, menus, 'menu', 'home_alone')
+            archive.extract(self.source, menus, 'menu', 'home_alone')
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue((menus / 'home_alone_vts_000_lu_001_pgc_001.mkv.receipt.json').exists())
+        output = io.StringIO()
+        with patch.object(archive, 'inventory', side_effect=lambda source, kind: inventory if kind == 'menu' else {}), \
+             patch.object(archive, 'probe', return_value=self.media), contextlib.redirect_stdout(output):
+            self.assertEqual(archive.verify(self.source, self.out, 'home_alone'), 0)
+        report = json.loads(Path(output.getvalue().strip().removeprefix('Verification result: ')).read_text())
+        self.assertEqual(report['files'][0]['file'], 'menus/home_alone_vts_000_lu_001_pgc_001.mkv')
+
+    def test_existing_unprefixed_menu_keeps_its_name(self):
+        menus = self.out / 'menus'
+        menus.mkdir(parents=True)
+        name = 'vts_000_lu_001_pgc_001.mkv'
+        (menus / name).write_bytes(b'existing menu')
+        archive.write_receipt(menus / name, archive.source_identity(self.source), archive.digest(menus / name))
+        with patch.object(archive, 'inventory', return_value={name: []}), \
+             patch.object(archive, 'probe', return_value=self.media):
+            archive.extract(self.source, menus, 'menu', 'home_alone')
+        self.assertFalse((menus / ('home_alone_' + name)).exists())
+        output = io.StringIO()
+        with patch.object(archive, 'inventory', side_effect=lambda source, kind: {name: []} if kind == 'menu' else {}), \
+             patch.object(archive, 'probe', return_value=self.media), contextlib.redirect_stdout(output):
+            self.assertEqual(archive.verify(self.source, self.out, 'home_alone'), 0)
+
     def test_only_dvd_pcm_streams_use_lossless_pcm_conversion(self):
         streams = [
             {"index": 0, "codec_name": "mpeg2video"},

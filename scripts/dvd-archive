@@ -89,6 +89,12 @@ def prefixed_name(name, prefix):
     return f"{prefix}_{name}" if prefix else name
 
 
+def menu_name(name, prefix, menus):
+    """Continue using an existing unprefixed menu without renaming it."""
+    prefixed = prefixed_name(name, prefix)
+    if prefix and not (menus / prefixed).exists() and (menus / name).exists():
+        return name
+    return prefixed
 
 def run(command):
     result = subprocess.run(command, capture_output=True, text=True)
@@ -1035,8 +1041,8 @@ def compare_dvd(source, options, output, title=None):
 def extract(source, out, kind, prefix=""):
     identity = source_identity(source)
     expected = inventory(source, kind)
-    if kind == "title":
-        expected = {prefixed_name(name, prefix): item for name, item in expected.items()}
+    expected = {(menu_name(name, prefix, out) if kind == "menu" else prefixed_name(name, prefix)): item
+                for name, item in expected.items()}
     galleries = confirmed_galleries(source) if kind == "title" else {}
     out.mkdir(parents=True, exist_ok=True)
     fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY)
@@ -1118,7 +1124,7 @@ def verify(source, root, prefix=""):
     trace_cache = {}
     expected = {}
     for kind, directory in (("title", "titles"), ("menu", "menus")):
-        expected.update({f"{directory}/{prefixed_name(name, prefix) if kind == 'title' else name}": (kind, item)
+        expected.update({f"{directory}/{menu_name(name, prefix, root / directory) if kind == 'menu' else prefixed_name(name, prefix)}": (kind, item)
                          for name, item in inventory(source, kind).items()})
     actual = {str(p.relative_to(root)) for directory in ("titles", "menus")
               for p in (root / directory).glob("*.mkv")}
@@ -1224,9 +1230,8 @@ def main(mode=None):
     out = Path(parsed.output).resolve()
     try:
         if mode == "menu":
-            if parsed.name is not None:
-                raise ValueError("--name applies to title extraction, not menus")
-            extract(source, out, mode)
+            prefix = archive_prefix(out.parent / "titles", source, parsed.name, create=True)
+            extract(source, out, mode, prefix)
         elif mode == "verify":
             prefix = archive_prefix(out / "titles", source, parsed.name)
             return verify(source, out, prefix)

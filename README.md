@@ -131,9 +131,10 @@ a full decode.
 
 ### Disc names in filenames
 
-New DVD titles and Blu-ray playlists use the source folder or ISO filename as a
+New DVD titles and menus, and Blu-ray playlists, use the source folder or ISO filename as a
 prefix, for example `home_alone_disc_1_title_001.mkv` or
-`home_alone_disc_1_playlist_00001.mkv`. Names are lowercased, whitespace becomes
+`home_alone_disc_1_playlist_00001.mkv`. A DVD menu might be named
+`home_alone_disc_1_vts_001_lu_001_pgc_001.mkv`. Names are lowercased, whitespace becomes
 underscores, punctuation is removed, and repeated underscores are collapsed.
 For `VIDEO_TS` or `BDMV` directories, the parent folder supplies the name.
 Use `--name` to choose a different name on the first extraction:
@@ -143,11 +144,12 @@ dvd-extract --name "Home Alone Disc 1" /path/to/disc.iso /path/to/output
 bluray-extract --name "Home Alone Disc 1" /path/to/disc.iso /path/to/output
 ```
 
-The same option is available on the title-only extractors. The chosen name is
+The same option is available on the title and menu extractors. The chosen name is
 stored in `titles/.disc-archive-naming.json` so verification and resumed runs
 use the same names even if the source is moved. Existing archives using
-unprefixed names keep those names; files are not renamed automatically. Menu
-and gallery names are unchanged. An override must match the archive's existing
+unprefixed names keep those names; files are not renamed automatically. Existing
+unprefixed menus also keep their names, even in an archive with prefixed titles.
+Gallery names are unchanged. An override must match the archive's existing
 naming choice. If normalization leaves no usable characters, supply `--name`.
 
 ## DVD-Video usage
