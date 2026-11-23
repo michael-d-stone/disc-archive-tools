@@ -69,6 +69,41 @@ class ArchiveTests(unittest.TestCase):
             "-c", "copy", "-c:1", "pcm_s16le", "-c:3", "pcm_s24le",
         ])
 
+    def test_timestamp_failure_retries_but_other_errors_do_not(self):
+        reason = 'Non-monotonic DTS'
+        calls = []
+
+        def ffmpeg(command, **kwargs):
+            calls.append(command)
+            if '-xerror' in command:
+                kwargs['stderr'].write(reason)
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(archive, 'probe_dvd_streams', return_value=[]), \
+             patch.object(archive.subprocess, 'run', side_effect=ffmpeg):
+            archive.remux_dvd(self.source, [], self.root / 'out.mkv')
+            self.assertEqual(len(calls), 2)
+            self.assertNotIn('-xerror', calls[1])
+            calls.clear()
+            reason = 'read failure'
+            with self.assertRaises(subprocess.CalledProcessError):
+                archive.remux_dvd(self.source, [], self.root / 'out.mkv')
+            self.assertEqual(len(calls), 1)
+
+    def test_timestamp_retry_rejects_other_ffmpeg_errors(self):
+        def ffmpeg(command, **kwargs):
+            if '-xerror' in command:
+                kwargs['stderr'].write('Non-monotonic DTS')
+                raise subprocess.CalledProcessError(1, command)
+            kwargs['stderr'].write('Error reading input\n')
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(archive, 'probe_dvd_streams', return_value=[]), \
+             patch.object(archive.subprocess, 'run', side_effect=ffmpeg):
+            with self.assertRaisesRegex(ValueError, 'Error reading input'):
+                archive.remux_dvd(self.source, [], self.root / 'out.mkv')
+
     def test_dvd_probe_reads_json_separately_from_stdout_diagnostics(self):
         streams = [{"index": 0, "codec_name": "mpeg2video"}]
 
@@ -407,6 +442,27 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(result['method'], 'chapters')
         self.assertEqual(result['streams'][0]['packets'], 2)
         self.assertTrue(result['whole_source_prefix_checked'])
+
+    def test_source_comparison_reports_timestamp_adjustment(self):
+        video = {"index": 0, "codec_type": "video", "codec_name": "mpeg2video"}
+        audio = {"index": 1, "codec_type": "audio", "codec_name": "ac3"}
+        output = self.root / 'out.mkv'
+        media = {"streams": [video, audio], "chapter_starts": []}
+
+        @contextlib.contextmanager
+        def records(command, prefix):
+            stream = int(command[command.index('-select_streams') + 1])
+            pts = 1.002 if stream == 1 and command[-1] == str(output) else 1 if stream == 1 else 0
+            yield iter([{"pts_time": str(pts), "dts_time": str(pts),
+                         "duration_time": "1", "data_hash": str(stream)}])
+
+        with patch.object(archive, 'probe_dvd_streams', return_value=[video, audio]), \
+             patch.object(archive, 'probe', return_value=media), \
+             patch.object(archive, 'probe_records', side_effect=records):
+            result = self.real_compare_dvd(self.source, ['-title', '1'], output)
+        self.assertEqual(len(result['timestamp_adjustments']), 2)
+        self.assertEqual(result['timestamp_adjustments'][0]['difference_seconds'], 0.002)
+        self.assertIn('timestamp fields', result['warnings'][0])
 
     def test_chapter_comparison_rejects_audio_omitted_by_chapter_reads(self):
         video = {"index": 0, "codec_type": "video", "codec_name": "mpeg2video"}

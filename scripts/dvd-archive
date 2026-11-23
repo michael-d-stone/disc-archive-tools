@@ -269,9 +269,38 @@ def remux_dvd(source, options, destination):
         if stream.get("codec_name") == "pcm_dvd":
             codec = "pcm_s16le" if stream.get("sample_fmt") == "s16" else "pcm_s24le"
             codecs.extend([f"-c:{stream['index']}", codec])
-    subprocess.run([FFMPEG, "-nostdin", "-xerror", "-abort_on", "empty_output", "-y",
-                    *input_args, "-i", str(source), "-map", "0", *codecs,
-                    "-f", "matroska", str(destination)], check=True)
+    args = ["-abort_on", "empty_output", "-y", *input_args, "-i", str(source),
+            "-map", "0", *codecs, "-f", "matroska", str(destination)]
+    with tempfile.TemporaryFile(mode="w+") as errors:
+        try:
+            subprocess.run([FFMPEG, "-nostdin", "-xerror", *args], check=True, stderr=errors)
+        except subprocess.CalledProcessError:
+            errors.seek(0)
+            diagnostic = errors.read()
+            print(diagnostic, file=sys.stderr, end="")
+            if "Non-monotonic DTS" not in diagnostic:
+                raise
+            print("Retrying timestamp failure; output must pass source comparison.", file=sys.stderr)
+            with tempfile.TemporaryFile(mode="w+") as retry_errors:
+                try:
+                    subprocess.run([FFMPEG, "-nostdin", "-v", "error", *args],
+                                   check=True, stderr=retry_errors)
+                except subprocess.CalledProcessError:
+                    retry_errors.seek(0)
+                    print(retry_errors.read(), file=sys.stderr, end="")
+                    raise
+                retry_errors.seek(0)
+                lines = retry_errors.read().splitlines()
+            # libdvdnav reports these for directory/ISO sources even on success.
+            harmless = ("libdvdread: Couldn't find device name.",
+                        "libdvdnav: Couldn't find device name.",
+                        "libdvdnav: Can't read name block. Probably not a DVD-ROM device.")
+            unexpected = [line for line in lines if not any(line.endswith(message) for message in harmless)]
+            if unexpected:
+                raise ValueError("FFmpeg retry reported errors: " + "\n".join(unexpected))
+        else:
+            errors.seek(0)
+            print(errors.read(), file=sys.stderr, end="")
 
 
 def packet_counts(path):
@@ -646,7 +675,7 @@ def timestamp(record, field):
 def compare_packet_stream(source, options, output, source_index, output_index,
                           chapter_numbers, offsets, expected_durations, kind,
                           duration_warnings=None, require_duration_match=True,
-                          allow_output_tail=False):
+                          allow_output_tail=False, adjustments=None):
     output_args = [str(output)]
     output_command = packet_command(output_args, output_index)
     counts = []
@@ -694,6 +723,12 @@ def compare_packet_stream(source, options, output, source_index, output_index,
                         expected = before if field == "duration_time" else before + offsets[chapter]
                         if abs(expected - after) > 0.003:
                             raise SourceComparisonError(f"{label}: {field} differs from source")
+                        if adjustments is not None and field != "duration_time" and abs(expected - after) > 0.0011:
+                            adjustments.append({"stream": output_index, "chapter": chapter,
+                                                "packet": count, "field": field,
+                                                "source_seconds": before, "output_seconds": after,
+                                                "offset_seconds": offsets[chapter],
+                                                "difference_seconds": round(after - expected, 6)})
                     if kind == "video" and source_pts is not None:
                         duration = timestamp(original, "duration_time") or 0
                         last_end = max(last_end if last_end is not None else source_pts,
@@ -862,11 +897,13 @@ def compare_dvd_media(source, options, output, title=None, chapters=False):
     offsets = {}
     comparison = {"verified": True, "method": "chapters" if chapters else "whole", "streams": []}
     duration_warnings = []
+    adjustments = []
     original, actual = videos[0]
     counts = compare_packet_stream(source, options, output, original["index"], actual["index"],
                                    chapter_numbers, offsets, durations, "video",
                                    duration_warnings=duration_warnings,
-                                   require_duration_match=bool(title and len(title[2]) > 1 and not chapters))
+                                   require_duration_match=bool(title and len(title[2]) > 1 and not chapters),
+                                   adjustments=adjustments)
     if duration_warnings:
         comparison["warnings"] = duration_warnings
     if chapters:
@@ -896,8 +933,13 @@ def compare_dvd_media(source, options, output, title=None, chapters=False):
             comparison["streams"].append({"index": actual["index"], "method": "decoded_pcm_sha256", "bytes": count})
         else:
             counts = compare_packet_stream(source, options, output, original["index"], actual["index"],
-                                           chapter_numbers, offsets, {}, kind)
+                                           chapter_numbers, offsets, {}, kind, adjustments=adjustments)
             comparison["streams"].append({"index": actual["index"], "method": "packet_sha256", "packets": sum(counts)})
+    if adjustments:
+        comparison["timestamp_adjustments"] = adjustments
+        comparison.setdefault("warnings", []).append(
+            f"{len(adjustments)} packet timestamp fields differ from the source by more than 1.1 ms; "
+            "see source comparison for details")
     return comparison
 
 
