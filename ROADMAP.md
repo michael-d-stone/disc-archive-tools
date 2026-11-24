@@ -27,6 +27,13 @@ unwrap preserved all 7,276 video and 7,574 audio packets and matched normalized
 source timestamps within Matroska rounding. DVD extraction now tries that
 correction before its general timestamp retry and records the detected wraps.
 
+### Workflow visibility — planned
+
+Bring the Blu-ray workflow's live FFmpeg transcript, progress meter, and
+persistent per-item logs to DVD title and menu extraction. Add the same
+byte-level fingerprint progress display while preserving concise behavior when
+output is redirected.
+
 ### Interactive still gallery export — implemented
 
 Asa Akira Is Pure Disc 2 titles 7–17 use DVD navigation instructions to
