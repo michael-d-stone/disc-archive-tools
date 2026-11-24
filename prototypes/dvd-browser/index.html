@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DVD ISO connection test</title>
+  <style>
+    :root { color-scheme: light dark; font: 1rem/1.5 system-ui, sans-serif; }
+    main { max-width: 36rem; margin: 10vh auto; padding: 0 1rem; }
+    button { font: inherit; min-height: 44px; padding: .5rem 1rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>DVD ISO connection test</h1>
+    <p>Check whether this browser can read individual sectors from the ISO served by your computer.</p>
+    <button id="check" type="button">Test ISO connection</button>
+    <p id="result" role="status"></p>
+  </main>
+  <script>
+    const button = document.querySelector("#check");
+    const result = document.querySelector("#result");
+    const sectorSize = 2048;
+
+    async function readSector(sector, size) {
+      const start = sector * sectorSize;
+      const end = start + sectorSize - 1;
+      const response = await fetch("/disc.iso", {
+        headers: { Range: `bytes=${start}-${end}` },
+        cache: "no-store",
+      });
+      if (response.status !== 206 ||
+          response.headers.get("Content-Range") !== `bytes ${start}-${end}/${size}`) {
+        if (response.body) await response.body.cancel();
+        throw new Error("The server did not return the requested byte range.");
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (bytes.length !== sectorSize) throw new Error("The sector was incomplete.");
+      return bytes;
+    }
+
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      result.textContent = "Reading ISO sectors…";
+      try {
+        const response = await fetch("/disc.iso", { method: "HEAD", cache: "no-store" });
+        const size = Number(response.headers.get("Content-Length"));
+        if (!response.ok || !Number.isSafeInteger(size) || size < 17 * sectorSize) {
+          throw new Error("The server did not report a usable ISO size.");
+        }
+        const lastSector = Math.floor(size / sectorSize) - 1;
+        const [descriptor] = await Promise.all([readSector(16, size), readSector(lastSector, size)]);
+        const identifier = new TextDecoder().decode(descriptor.subarray(1, 6));
+        const format = identifier === "CD001" ? " ISO 9660 signature detected." : "";
+        result.textContent = `Read two ISO sector requests successfully. Disc size: ${size.toLocaleString()} bytes.${format}`;
+      } catch (error) {
+        result.textContent = `Connection test failed. ${error.message}`;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

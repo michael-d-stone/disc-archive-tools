@@ -53,6 +53,34 @@ buttons, and testing those behaviors on discs authored differently. A
 desktop-player comparison is still open because mpv skipped the source
 disc's holds during testing.
 
+## SlutTV ISO playback — planned
+
+### DVD-Video prototype
+
+SlutTV will manage library metadata and serve the original readable ISO over
+HTTP range requests. The embedded player will use libdvdnav to run the
+disc's authored DVD menus. Touch and mouse will activate buttons directly
+on the menu artwork, and arrow keys and Enter will follow the disc's authored
+navigation. The first milestone is to verify menu video and audio, synchronized
+button highlights, Play, and chapter selection on iPhone Safari and a desktop
+browser.
+
+### Client-side decoding and deinterlacing
+
+Playback will keep the original ISO and encoded streams intact, with no
+server-side transcoding or client-side re-encoding. Use browser-native decoding
+where supported and evaluate FFmpeg in WebAssembly for streams that need
+software decoding. Run FFmpeg's `bwdif` filter on decoded interlaced frames
+before rendering when the device can sustain it. Verify playback and
+deinterlacing performance on real devices before expanding support to additional
+phones, TVs, and browsers.
+
+### Blu-ray navigation
+
+After the DVD milestone, prototype HDMV menus and pop-up navigation with
+libbluray. Investigate BD-J separately because it requires a compatible Java
+runtime.
+
 ## Blu-ray — next format
 
 ### Playlist extraction — in progress

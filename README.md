@@ -22,6 +22,13 @@ Planned support includes:
 - DVD-Audio
 
 
+### Planned browser playback
+
+SlutTV will manage library metadata and embed a browser player for readable
+disc ISOs, with navigation through the original disc menus. See the
+[SlutTV ISO playback roadmap](ROADMAP.md#sluttv-iso-playback--planned) for
+milestones and browser compatibility targets.
+
 ## Building on Debian 12
 
 Install the required packages:
