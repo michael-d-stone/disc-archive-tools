@@ -4,6 +4,7 @@
 """Extract and verify authored Blu-ray playlists."""
 import argparse
 import fcntl
+import hashlib
 from contextlib import ExitStack
 from itertools import zip_longest
 import json
@@ -12,6 +13,8 @@ import os
 from pathlib import Path
 import re
 import runpy
+import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -36,10 +39,88 @@ class TimestampDiscontinuity(ValueError):
     """An output packet has a repeated or backwards decoding timestamp."""
 
 
-def source_details(source):
+def format_bytes(value):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+
+
+def format_time(seconds):
+    seconds = max(0, int(seconds))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+
+
+class Progress:
+    """Adaptive terminal status for source fingerprints and FFmpeg work."""
+    frames = ("⌛", "⏳")
+
+    def __init__(self, stream=None, interactive=None):
+        self.stream = stream or sys.stderr
+        self.interactive = (self.stream.isatty() if interactive is None else interactive)
+        self.active = False
+        self.count = 0
+        self.last_percent = None
+
+    def show(self, message, final=False):
+        if self.interactive:
+            prefix = "✓" if final else self.frames[self.count % len(self.frames)]
+            self.count += 1
+            end = "\n" if final else ""
+            self.stream.write(f"\r\033[2K{prefix} {message}{end}")
+            self.stream.flush()
+        else:
+            self.stream.write(f"{message}\n")
+            self.stream.flush()
+
+    def clear(self):
+        if self.interactive and self.active:
+            self.stream.write("\r\033[2K")
+            self.stream.flush()
+        self.active = False
+
+    def fingerprint(self, processed, total, path, final=False):
+        percent = 100 if not total else min(100, processed * 100 / total)
+        if (not self.interactive and not final and self.last_percent is not None
+                and percent < self.last_percent + 5):
+            return
+        self.last_percent = percent
+        self.active = not final
+        self.show(f"Fingerprinting {percent:5.1f}%  {format_bytes(processed)} / "
+                  f"{format_bytes(total)}  {path}", final=final)
+
+    def playlist(self, label, position, duration, speed="", final=False):
+        if final:
+            position = duration
+        percent = 100 if not duration else min(100, position * 100 / duration)
+        suffix = f"  {speed}" if speed else ""
+        self.active = not final
+        self.show(f"{label}: {format_time(position)} / {format_time(duration)} "
+                  f"({percent:5.1f}%){suffix}", final=final)
+
+
+def digest_with_progress(path, progress, processed, total, label=None):
+    result = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            result.update(block)
+            processed += len(block)
+            progress.fingerprint(processed, total, label or path.name)
+    return result.hexdigest(), processed
+
+
+def source_details(source, progress=None):
     source = source.resolve(strict=True)
     if source.is_file():
-        return source, {"type": "file", "sha256": digest(source)}
+        if progress is None:
+            return source, {"type": "file", "sha256": digest(source)}
+        total = source.stat().st_size
+        progress.fingerprint(0, total, source.name)
+        checksum, processed = digest_with_progress(source, progress, 0, total)
+        progress.fingerprint(processed, total, source.name, final=True)
+        return source, {"type": "file", "sha256": checksum}
     if source.name.upper() == "BDMV":
         bdmv = source
         source = source.parent
@@ -48,15 +129,110 @@ def source_details(source):
         if len(matches) != 1:
             raise ValueError("Blu-ray directory must contain exactly one BDMV directory")
         bdmv = matches[0]
-    files = []
+    paths = []
     for path in sorted(bdmv.rglob("*")):
         if path.is_symlink():
             raise ValueError(f"Symbolic link in BDMV source: {path}")
         if path.is_file():
-            files.append({"file": str(path.relative_to(source)), "sha256": digest(path)})
-    if not files:
+            paths.append(path)
+    if not paths:
         raise ValueError("BDMV directory is empty")
+    if progress is None:
+        files = [{"file": str(path.relative_to(source)), "sha256": digest(path)} for path in paths]
+    else:
+        total = sum(path.stat().st_size for path in paths)
+        processed = 0
+        files = []
+        progress.fingerprint(0, total, paths[0].relative_to(source))
+        for path in paths:
+            checksum, processed = digest_with_progress(
+                path, progress, processed, total, path.relative_to(source)
+            )
+            files.append({"file": str(path.relative_to(source)), "sha256": checksum})
+        progress.fingerprint(processed, total, paths[-1].relative_to(source), final=True)
     return source, {"type": "directory", "files": files}
+
+
+def write_log_note(log, message):
+    with log.open("a", encoding="utf-8") as diagnostics:
+        diagnostics.write(message + "\n")
+    print(message, file=sys.stderr, flush=True)
+
+
+def parse_progress(line, state):
+    if "=" not in line:
+        return None
+    key, value = line.split("=", 1)
+    if key in ("out_time_us", "out_time_ms"):
+        try:
+            state["position"] = int(value) / 1_000_000
+        except ValueError:
+            return None
+    elif key == "speed":
+        state["speed"] = value
+    elif key == "progress":
+        return value
+    return None
+
+
+def run_ffmpeg(command, log, label, duration, append=False):
+    """Run FFmpeg, mirror its transcript to a log, and show live terminal state."""
+    mode = "ab" if append else "wb"
+    progress = Progress()
+    if not progress.interactive:
+        print(f"{label}: FFmpeg started; writing {log}", file=sys.stderr, flush=True)
+        with log.open("a" if append else "w", encoding="utf-8") as diagnostics:
+            diagnostics.write(f"=== FFmpeg command ===\n{shlex.join(command)}\n")
+            result = subprocess.run(command, stdout=diagnostics, stderr=subprocess.STDOUT)
+        print(f"{label}: FFmpeg {'completed' if not result.returncode else 'failed'}", file=sys.stderr,
+              flush=True)
+        return result
+
+    read_fd, write_fd = os.pipe()
+    progress_command = command.copy()
+    position = progress_command.index("-nostdin") + 1
+    progress_command[position:position] = ["-nostats", "-progress", f"pipe:{write_fd}"]
+    with log.open(mode) as diagnostics:
+        diagnostics.write((f"=== FFmpeg command ===\n{shlex.join(progress_command)}\n").encode())
+        diagnostics.flush()
+        try:
+            process = subprocess.Popen(progress_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       pass_fds=(write_fd,))
+        finally:
+            os.close(write_fd)
+        state = {"position": 0.0, "speed": ""}
+        buffers = {read_fd: b""}
+        descriptors = [process.stdout.fileno(), read_fd]
+        try:
+            while descriptors:
+                readable, _, _ = select.select(descriptors, [], [])
+                for descriptor in readable:
+                    data = os.read(descriptor, 8192)
+                    if not data:
+                        descriptors.remove(descriptor)
+                        continue
+                    if descriptor == process.stdout.fileno():
+                        progress.clear()
+                        diagnostics.write(data)
+                        diagnostics.flush()
+                        sys.stderr.buffer.write(data)
+                        sys.stderr.buffer.flush()
+                        progress.playlist(label, state["position"], duration, state["speed"])
+                    else:
+                        buffers[descriptor] += data
+                        lines = buffers[descriptor].split(b"\n")
+                        buffers[descriptor] = lines.pop()
+                        for line in lines:
+                            event = parse_progress(line.decode("utf-8", "replace"), state)
+                            if event is not None:
+                                progress.playlist(label, state["position"], duration,
+                                                  state["speed"], final=event == "end")
+        finally:
+            os.close(read_fd)
+            process.stdout.close()
+        result = subprocess.CompletedProcess(progress_command, process.wait())
+    progress.playlist(label, state["position"], duration, state["speed"], final=True)
+    return result
 
 
 def info_tool():
@@ -330,7 +506,7 @@ def extract(source, root, identity, playlists, prefix=""):
                     meta = work / "chapters.ffmetadata"
                     temp = work / "output.mkv"
                     metadata(meta, playlist)
-                    command = [FFMPEG, "-nostdin", "-hide_banner", "-xerror", "-y",
+                    command = [FFMPEG, "-nostdin", "-xerror", "-y",
                                "-playlist", str(number), "-i", "bluray:" + str(source),
                                "-f", "ffmetadata", "-i", str(meta)]
                     ordered = sorted(streams, key=lambda key: (
@@ -347,18 +523,15 @@ def extract(source, root, identity, playlists, prefix=""):
                                             f"language={language}"])
                         positions[kind] += 1
                     command.extend(["-f", "matroska", str(temp)])
-                    with log.open("w") as diagnostics:
-                        result = subprocess.run(command, stdout=diagnostics, stderr=subprocess.STDOUT)
+                    result = run_ffmpeg(command, log, name, playlist["duration"])
                     diagnostic_text = log.read_text(errors="replace")
                     if result.returncode and any(message in diagnostic_text for message in
                                                  ("dimensions not set", "sample rate not set")):
                         retry = command.copy()
                         position = retry.index("-playlist")
                         retry[position:position] = ["-probesize", "256M", "-analyzeduration", "150M"]
-                        with log.open("a") as diagnostics:
-                            diagnostics.write("\nRetrying with a larger input probe.\n")
-                            diagnostics.flush()
-                            result = subprocess.run(retry, stdout=diagnostics, stderr=subprocess.STDOUT)
+                        write_log_note(log, "Retrying with a larger input probe.")
+                        result = run_ffmpeg(retry, log, name, playlist["duration"], append=True)
                     if result.returncode:
                         diagnostics = log.read_text(errors="replace")
                         reason = next((line.strip() for line in reversed(diagnostics.splitlines())
@@ -386,21 +559,18 @@ def extract(source, root, identity, playlists, prefix=""):
                             f"dts=if(gte(DTS*TB\\,{threshold:.9f})\\,DTS-{jump:.9f}/TB\\,DTS)"
                         )
                         retry[-3:-3] = ["-bsf:v", expression]
-                        with log.open("a") as diagnostics:
-                            diagnostics.write(
-                                f"\nRetrying with original timestamps and a {jump:.9f}s "
-                                f"video wrap adjustment at {threshold:.9f}s.\n"
-                            )
-                            diagnostics.flush()
-                            result = subprocess.run(retry, stdout=diagnostics, stderr=subprocess.STDOUT)
+                        write_log_note(
+                            log, f"Retrying with original timestamps and a {jump:.9f}s "
+                            f"video wrap adjustment at {threshold:.9f}s."
+                        )
+                        result = run_ffmpeg(retry, log, name, playlist["duration"], append=True)
                         if result.returncode:
                             raise ValueError(f"Timestamp correction failed ({result.returncode}); see {log}")
                         observed = completeness(playlist, probe(temp))
                         check_packet_timestamps(temp)
                         correction["packets_checked"] = compare_boundary_packets(
                             source, number, temp, streams, correction)
-                        with log.open("a") as diagnostics:
-                            diagnostics.write(f"Source packet comparison passed: {correction['packets_checked']}\n")
+                        write_log_note(log, f"Source packet comparison passed: {correction['packets_checked']}")
                     checksum = digest(temp)
                     with temp.open("rb") as handle:
                         os.fsync(handle.fileno())
@@ -498,8 +668,7 @@ def main(mode):
     parser.add_argument("output", nargs="?" if mode != "verify" else None, default="bluray-extract")
     parsed = parser.parse_args()
     try:
-        print(f"Fingerprinting source: {parsed.source}", flush=True)
-        source, identity = source_details(Path(parsed.source))
+        source, identity = source_details(Path(parsed.source), Progress())
         playlists, menus = inventory(source)
         out = Path(parsed.output).resolve()
         if mode == "verify" and not out.is_dir():

@@ -110,6 +110,12 @@ manifest in `OUTPUT`. It continues after a playlist fails and exits with a
 nonzero status if any playlist fails verification. An interrupted run can be
 repeated and complete matching playlists are reused.
 
+When run in a terminal, fingerprinting shows an animated byte-progress display.
+Extraction shows a playlist progress meter while FFmpeg's normal diagnostic
+output scrolls live above it; the complete FFmpeg transcript is also saved in
+the matching `OUTPUT/logs/playlist_XXXXX.log`. Redirected output uses ordinary
+progress lines instead of terminal control characters.
+
 Use `bluray-title-extract SOURCE [OUTPUT]` for extraction alone and
 `bluray-verify SOURCE OUTPUT` for a separate recheck. The default extraction
 output directory is `bluray-extract/`. Verification preserves the first

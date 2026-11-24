@@ -66,6 +66,40 @@ class BluRayTests(unittest.TestCase):
             _, report = self.verify({1: self.playlist})
             self.assertEqual(report["summary"]["failed"], 2)
 
+    def test_fingerprint_progress_reports_iso_and_bdmv_bytes(self):
+        class Reporter:
+            def __init__(self):
+                self.events = []
+            def fingerprint(self, processed, total, path, final=False):
+                self.events.append((processed, total, str(path), final))
+
+        reporter = Reporter()
+        _, identity = source_details(self.source, reporter)
+        self.assertEqual(identity["sha256"], source_details(self.source)[1]["sha256"])
+        self.assertEqual(reporter.events[-1], (4, 4, "disc.iso", True))
+
+        bdmv = self.root / "directory" / "BDMV"
+        (bdmv / "STREAM").mkdir(parents=True)
+        (bdmv / "index.bdmv").write_bytes(b"abc")
+        (bdmv / "STREAM" / "00000.m2ts").write_bytes(b"defgh")
+        reporter = Reporter()
+        _, identity = source_details(bdmv.parent, reporter)
+        self.assertEqual(sum(len(item["sha256"]) for item in identity["files"]), 128)
+        self.assertEqual(reporter.events[-1], (8, 8, "BDMV/index.bdmv", True))
+
+    def test_noninteractive_ffmpeg_status_is_logged(self):
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(stream), \
+             patch.dict(globals_, {"Progress": lambda: module["Progress"](stream, interactive=False),
+                                   "probe": lambda path: self.media,
+                                   "check_packet_timestamps": lambda path: None}), \
+             patch.object(subprocess, "run", side_effect=self.ffmpeg):
+            self.assertEqual(extract(self.source, self.out, self.identity, {1: self.playlist}), 0)
+        text = (self.out / "logs/playlist_00001.log").read_text()
+        self.assertIn("=== FFmpeg command ===", text)
+        self.assertIn("FFmpeg started", stream.getvalue())
+        self.assertIn("FFmpeg completed", stream.getvalue())
+
     def test_prefixed_playlist_extraction_verifies_and_resumes(self):
         with patch.dict(globals_, {"probe": lambda path: self.media, "check_packet_timestamps": lambda path: None}), \
              patch.object(subprocess, "run", side_effect=self.ffmpeg) as ffmpeg:
