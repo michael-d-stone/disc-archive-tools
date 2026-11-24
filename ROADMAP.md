@@ -19,6 +19,14 @@ Queens 11. All passed the current inventory, receipt, checksum, and media-probe
 checks. The original manifests were preserved and timestamped results saved.
 Passing these checks does not establish full content preservation or playback.
 
+An Elegant Angel DVD, *Jada Fire Is Squirtwoman 4*, exposed complete 33-bit
+MPEG timestamp-counter cycles at several chapter boundaries. FFmpeg's general
+discontinuity handling eventually shifted audio by about 82 ms, while reading
+chapters separately omitted 2 video and 11 audio packets. A targeted clock
+unwrap preserved all 7,276 video and 7,574 audio packets and matched normalized
+source timestamps within Matroska rounding. DVD extraction now tries that
+correction before its general timestamp retry and records the detected wraps.
+
 ### Interactive still gallery export — implemented
 
 Asa Akira Is Pure Disc 2 titles 7–17 use DVD navigation instructions to
@@ -59,6 +67,35 @@ FFmpeg also failed to read some VC-1 dimensions or audio parameters, and
 reported corrupt packets on another playlist. A larger probe lets some files
 proceed, but it does not resolve all failures. These outputs need further
 investigation before the workflow can be considered complete for these discs.
+
+### Elegant Angel discs — observations
+
+Tests of *Curvy Girls 3* and *Asa Akira Is Insatiable*, identified as Elegant
+Angel releases, showed strikingly similar playlist structures and failures:
+
+- Playlist 00007 repeats clip 00009 seven times. Both extractions reported
+  a repeated audio DTS at 60.001 seconds.
+- Playlists 00009 and 00010 failed their timestamp-correction retries on a
+  backwards video DTS.
+- The long playlist 00012, likely the feature on each disc, failed its retry
+  when FFmpeg could not determine video dimensions and audio sample rate.
+  FFmpeg also reported corrupt packets while reading it.
+- Playlist 00000 stopped on a packet FFmpeg flagged as corrupt.
+
+The shared patterns may reflect a common studio authoring workflow or template;
+that is a hypothesis, not an established cause. They do not establish whether
+the source data is damaged, the disc authoring is unusual, or our reading and
+correction paths are at fault. Compare direct clip reads with playlist reads,
+and test conventional Blu-rays as a baseline before drawing conclusions.
+The original test logs and manifests identify the individual failures.
+
+*Asa Akira Is Insatiable 2* shows the same patterns under different playlist
+numbers. Playlist 00005 repeats clip 00004 seven times and fails on the same
+60.001-second audio DTS. The likely feature is playlist 00001, about 3 hours
+40 minutes; its retry also lacks video dimensions and audio sample rate.
+Playlists 00003, 00004, and 00012 fail their timestamp retries on backwards
+video DTS. Playlist numbers and clip IDs therefore cannot identify these
+patterns reliably across releases.
 
 Next, extend lossless boundary handling to other playlist layouts and dynamic
 stream changes, then re-extract and check video and audio continuity. Test
