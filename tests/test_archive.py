@@ -153,13 +153,34 @@ class ArchiveTests(unittest.TestCase):
         with patch.object(archive, 'probe_dvd_streams', return_value=[]), \
              patch.object(archive.subprocess, 'run', side_effect=ffmpeg):
             archive.remux_dvd(self.source, [], self.root / 'out.mkv')
-            self.assertEqual(len(calls), 2)
-            self.assertNotIn('-xerror', calls[1])
+            self.assertEqual(len(calls), 3)
+            self.assertIn('-copyts', calls[1])
+            self.assertNotIn('-xerror', calls[2])
             calls.clear()
             reason = 'read failure'
             with self.assertRaises(subprocess.CalledProcessError):
                 archive.remux_dvd(self.source, [], self.root / 'out.mkv')
             self.assertEqual(len(calls), 1)
+
+    def test_timestamp_failure_first_retries_with_mpeg_clock_unwrap(self):
+        streams = [{"index": 0, "codec_type": "video", "codec_name": "mpeg2video"},
+                   {"index": 1, "codec_type": "audio", "codec_name": "ac3"}]
+        calls = []
+
+        def ffmpeg(command, **kwargs):
+            calls.append(command)
+            if '-copyts' not in command:
+                kwargs['stderr'].write('Non-monotonic DTS')
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(archive, 'probe_dvd_streams', return_value=streams), \
+             patch.object(archive.subprocess, 'run', side_effect=ffmpeg):
+            archive.remux_dvd(self.source, [], self.root / 'out.mkv')
+        self.assertEqual(len(calls), 2)
+        self.assertIn('-copyts', calls[1])
+        self.assertIn('-start_at_zero', calls[1])
+        self.assertEqual(calls[1].count('setts=pts=mod(PTS\\,4294967296):dts=mod(DTS\\,4294967296)'), 2)
 
     def test_timestamp_retry_rejects_other_ffmpeg_errors(self):
         def ffmpeg(command, **kwargs):
@@ -533,6 +554,34 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(len(result['timestamp_adjustments']), 2)
         self.assertEqual(result['timestamp_adjustments'][0]['difference_seconds'], 0.002)
         self.assertIn('timestamp fields', result['warnings'][0])
+
+    def test_source_comparison_verifies_mpeg_clock_unwrap(self):
+        video = {"index": 0, "codec_type": "video", "codec_name": "mpeg2video"}
+        output = self.root / 'out.mkv'
+        media = {"streams": [video], "chapter_starts": []}
+        wrap = archive.MPEG_CLOCK_WRAP_SECONDS
+
+        def packet(pts, digest):
+            return {"pts_time": str(pts), "dts_time": str(pts),
+                    "duration_time": "1", "data_hash": digest}
+
+        @contextlib.contextmanager
+        def records(command, prefix):
+            data = ([packet(0, 'a'), packet(1, 'b')]
+                    if command[-1] == str(output)
+                    else [packet(0, 'a'), packet(wrap + 1, 'b')])
+            yield iter(data)
+
+        with patch.object(archive, 'probe_dvd_streams', return_value=[video]), \
+             patch.object(archive, 'probe', return_value=media), \
+             patch.object(archive, 'probe_records', side_effect=records):
+            result = self.real_compare_dvd(self.source, ['-title', '1'], output, (1, 2, [2]))
+        self.assertTrue(result['verified'])
+        self.assertEqual(result['streams'][0]['packets'], 2)
+        self.assertEqual(result['mpeg_clock_wraps'], [{
+            'stream': 0, 'chapter': None, 'packet': 2,
+            'field': 'pts_time', 'cycles_removed': 1}])
+        self.assertIn('clock-wrap', result['warnings'][0])
 
     def test_chapter_comparison_rejects_audio_omitted_by_chapter_reads(self):
         video = {"index": 0, "codec_type": "video", "codec_name": "mpeg2video"}

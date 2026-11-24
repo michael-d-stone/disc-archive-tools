@@ -188,9 +188,13 @@ duration differs from the authored DVD metadata, the result is verified with
 a warning showing the differing durations. The warning does not establish why
 they differ. Source comparison adds disc reads and processing time.
 
-If FFmpeg stops on a non-monotonic decode timestamp, extraction retries without
-`-xerror`. The retry is rejected if FFmpeg reports other errors, and its output
-must still pass source comparison before publication. Packet timestamp
+If FFmpeg stops on a non-monotonic decode timestamp, extraction first retries
+with the original timestamps while explicitly unwrapping exact cycles of the
+DVD's 33-bit MPEG clock. The verifier records each wrap transition and requires
+every packet payload and normalized timestamp to match the source. If that
+targeted retry does not apply, extraction retries without `-xerror`. A retry is
+rejected if FFmpeg reports other errors, and its output must still pass source
+comparison before publication. Packet timestamp
 differences above 1.1 ms and within the 3 ms comparison tolerance are recorded
 in the source comparison and reported as warnings; smaller differences can arise
 from Matroska timestamp rounding. Larger differences fail verification.

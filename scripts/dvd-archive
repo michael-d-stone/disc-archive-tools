@@ -20,6 +20,7 @@ import tempfile
 
 FFMPEG = "/opt/ffmpeg-dvd/bin/ffmpeg"
 FFPROBE = "/opt/ffmpeg-dvd/bin/ffprobe"
+MPEG_CLOCK_WRAP_SECONDS = 2 ** 32 / 90000
 
 
 def digest(path):
@@ -326,7 +327,29 @@ def remux_dvd(source, options, destination):
             print(diagnostic, file=sys.stderr, end="")
             if "Non-monotonic DTS" not in diagnostic:
                 raise
-            print("Retrying timestamp failure; output must pass source comparison.", file=sys.stderr)
+            # DVD MPEG timestamps are 33-bit 90 kHz counters. Some authored
+            # titles advance by a complete counter cycle at clip boundaries.
+            # Preserve the input timestamps and remove only those exact cycles.
+            expression = "setts=pts=mod(PTS\\,4294967296):dts=mod(DTS\\,4294967296)"
+            clock_args = args.copy()
+            filters = []
+            if any(stream.get("codec_type") == "video" for stream in streams):
+                filters.extend(["-bsf:v", expression])
+            if any(stream.get("codec_type") == "audio" for stream in streams):
+                filters.extend(["-bsf:a", expression])
+            clock_args[-3:-3] = filters
+            print("Retrying with explicit 33-bit MPEG clock unwrapping; "
+                  "output must pass source comparison.", file=sys.stderr)
+            try:
+                with tempfile.TemporaryFile(mode="w+") as clock_errors:
+                    subprocess.run([FFMPEG, "-nostdin", "-v", "error", "-xerror",
+                                    "-copyts", "-start_at_zero", *clock_args],
+                                   check=True, stderr=clock_errors)
+                return
+            except subprocess.CalledProcessError:
+                pass
+            print("Clock unwrapping did not resolve the timestamp failure; "
+                  "retrying with FFmpeg timestamp correction.", file=sys.stderr)
             with tempfile.TemporaryFile(mode="w+") as retry_errors:
                 try:
                     subprocess.run([FFMPEG, "-nostdin", "-v", "error", *args],
@@ -718,10 +741,20 @@ def timestamp(record, field):
     return value
 
 
+def wrapped_timestamp(before, after, offset=0):
+    """Map an exact MPEG 33-bit clock cycle onto the output timeline."""
+    expected = before + offset
+    cycles = round((after - expected) / MPEG_CLOCK_WRAP_SECONDS)
+    adjusted = expected + cycles * MPEG_CLOCK_WRAP_SECONDS
+    if cycles and abs(after - adjusted) <= 0.003:
+        return adjusted, cycles
+    return expected, 0
+
+
 def compare_packet_stream(source, options, output, source_index, output_index,
                           chapter_numbers, offsets, expected_durations, kind,
                           duration_warnings=None, require_duration_match=True,
-                          allow_output_tail=False, adjustments=None):
+                          allow_output_tail=False, adjustments=None, clock_wraps=None):
     output_args = [str(output)]
     output_command = packet_command(output_args, output_index)
     counts = []
@@ -734,6 +767,7 @@ def compare_packet_stream(source, options, output, source_index, output_index,
             source_command = packet_command(source_args, source_index)
             first_pts = None
             last_end = None
+            wrap_state = {}
             count = 0
             with probe_records(source_command, "pts_time=") as source_records:
                 for original in source_records:
@@ -757,6 +791,7 @@ def compare_packet_stream(source, options, output, source_index, output_index,
                         raise SourceComparisonError(f"{label}: cannot establish timestamp offset")
                     fields = ("pts_time", "duration_time") if kind == "video" else (
                         "pts_time", "dts_time", "duration_time")
+                    normalized_source_pts = source_pts
                     for field in fields:
                         before = timestamp(original, field)
                         after = timestamp(actual, field)
@@ -766,7 +801,21 @@ def compare_packet_stream(source, options, output, source_index, output_index,
                             continue
                         if before is None or after is None:
                             raise SourceComparisonError(f"{label}: {field} is unavailable for comparison")
-                        expected = before if field == "duration_time" else before + offsets[chapter]
+                        cycles = 0
+                        if field == "duration_time":
+                            expected = before
+                        else:
+                            expected, cycles = wrapped_timestamp(
+                                before, after, offsets[chapter])
+                            if field == "pts_time":
+                                normalized_source_pts = before + cycles * MPEG_CLOCK_WRAP_SECONDS
+                            key = (chapter, field)
+                            if (cycles and clock_wraps is not None
+                                    and wrap_state.get(key) != cycles):
+                                clock_wraps.append({"stream": output_index, "chapter": chapter,
+                                                    "packet": count, "field": field,
+                                                    "cycles_removed": -cycles})
+                            wrap_state[key] = cycles
                         if abs(expected - after) > 0.003:
                             raise SourceComparisonError(f"{label}: {field} differs from source")
                         if adjustments is not None and field != "duration_time" and abs(expected - after) > 0.0011:
@@ -775,10 +824,10 @@ def compare_packet_stream(source, options, output, source_index, output_index,
                                                 "source_seconds": before, "output_seconds": after,
                                                 "offset_seconds": offsets[chapter],
                                                 "difference_seconds": round(after - expected, 6)})
-                    if kind == "video" and source_pts is not None:
+                    if kind == "video" and normalized_source_pts is not None:
                         duration = timestamp(original, "duration_time") or 0
-                        last_end = max(last_end if last_end is not None else source_pts,
-                                       source_pts + duration)
+                        last_end = max(last_end if last_end is not None else normalized_source_pts,
+                                       normalized_source_pts + duration)
             if kind == "video":
                 if not count or first_pts is None or last_end is None:
                     raise SourceComparisonError(f"Video source chapter {chapter or 'whole'} is empty")
@@ -944,12 +993,13 @@ def compare_dvd_media(source, options, output, title=None, chapters=False):
     comparison = {"verified": True, "method": "chapters" if chapters else "whole", "streams": []}
     duration_warnings = []
     adjustments = []
+    clock_wraps = []
     original, actual = videos[0]
     counts = compare_packet_stream(source, options, output, original["index"], actual["index"],
                                    chapter_numbers, offsets, durations, "video",
                                    duration_warnings=duration_warnings,
                                    require_duration_match=bool(title and len(title[2]) > 1 and not chapters),
-                                   adjustments=adjustments)
+                                   adjustments=adjustments, clock_wraps=clock_wraps)
     if duration_warnings:
         comparison["warnings"] = duration_warnings
     if chapters:
@@ -979,13 +1029,19 @@ def compare_dvd_media(source, options, output, title=None, chapters=False):
             comparison["streams"].append({"index": actual["index"], "method": "decoded_pcm_sha256", "bytes": count})
         else:
             counts = compare_packet_stream(source, options, output, original["index"], actual["index"],
-                                           chapter_numbers, offsets, {}, kind, adjustments=adjustments)
+                                           chapter_numbers, offsets, {}, kind, adjustments=adjustments,
+                                           clock_wraps=clock_wraps)
             comparison["streams"].append({"index": actual["index"], "method": "packet_sha256", "packets": sum(counts)})
     if adjustments:
         comparison["timestamp_adjustments"] = adjustments
         comparison.setdefault("warnings", []).append(
             f"{len(adjustments)} packet timestamp fields differ from the source by more than 1.1 ms; "
             "see source comparison for details")
+    if clock_wraps:
+        comparison["mpeg_clock_wraps"] = clock_wraps
+        comparison.setdefault("warnings", []).append(
+            f"Normalized {len(clock_wraps)} MPEG clock-wrap transitions; "
+            "all packet contents and resulting timestamps matched the source")
     return comparison
 
 
